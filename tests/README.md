@@ -17,12 +17,16 @@ docker compose up -d --build
 
 ```bash
 python tests/smoke_downstream_client.py \
-  --ws-url ws://127.0.0.1:8766
+  --ws-url ws://127.0.0.1:8766/ws/klines \
+  --ack-enabled \
+  --downstream-region ap-northeast-1
 ```
 
 参数说明：
 
 - `--max-messages N`：消费 N 条后自动退出
+- `--ack-enabled`：把 `event_id + downstream_receive_ms + downstream_region` 回传给服务端
+- `--downstream-region`：下游所属 region（用于服务侧 region 对齐统计）
 
 ## 2.1) 启动告警客户端测试（直连 alerts WebSocket）
 
@@ -58,9 +62,12 @@ docker compose logs -f market-watcher-klines
 
 ```bash
 python tests/smoke_check_latency.py \
-  --ws-url ws://127.0.0.1:8766 \
+  --ws-url ws://127.0.0.1:8766/ws/klines \
   --sample-size 100 \
-  --min-samples 20 \
+  --required-batches 3 \
+  --expected-symbols 530 \
+  --max-missing-symbols 10 \
+  --max-rest-ratio 0.05 \
   --warn-e2e-p95-ms 1500 \
   --strict
 ```

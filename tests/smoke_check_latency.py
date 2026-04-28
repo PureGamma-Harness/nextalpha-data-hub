@@ -34,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warn-e2e-p95-ms", type=float, default=1500.0)
     parser.add_argument("--warn-e2s-p95-ms", type=float, default=500.0, help="exchange_to_service p95 warning")
     parser.add_argument("--warn-s2d-p95-ms", type=float, default=1000.0, help="service_to_downstream p95 warning")
+    parser.add_argument("--expected-symbols", type=int, default=0, help="Expected symbols per closed batch (0=disable batch checks)")
+    parser.add_argument("--max-missing-symbols", type=int, default=10, help="Allowed missing symbols per batch")
+    parser.add_argument("--max-rest-ratio", type=float, default=0.0, help="Allowed REST ratio per batch, e.g. 0.05")
+    parser.add_argument("--required-batches", type=int, default=1, help="Require at least this many closed batches for acceptance")
     parser.add_argument("--strict", action="store_true", help="Return non-zero when any warning threshold is exceeded")
     return parser.parse_args()
 
@@ -52,16 +56,22 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
-async def _collect_samples(args: argparse.Namespace) -> tuple[list[float], list[float], list[float], int, int]:
+async def _collect_samples(
+    args: argparse.Namespace,
+) -> tuple[list[float], list[float], list[float], int, int, list[dict[str, float]]]:
     e2e_values: list[float] = []
     e2s_values: list[float] = []
     s2d_values: list[float] = []
     region_aligned_cnt = 0
     region_known_cnt = 0
+    batch_summaries: list[dict[str, float]] = []
 
     deadline = time.time() + args.max_seconds
     async with websockets.connect(args.ws_url, ping_interval=20, ping_timeout=20) as ws:
-        while len(e2e_values) < args.sample_size and time.time() < deadline:
+        while (
+            (len(e2e_values) < args.sample_size or len(batch_summaries) < args.required_batches)
+            and time.time() < deadline
+        ):
             timeout_s = max(0.1, min(5.0, deadline - time.time()))
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
@@ -72,12 +82,15 @@ async def _collect_samples(args: argparse.Namespace) -> tuple[list[float], list[
             rows = msg if isinstance(msg, list) else [msg]
             now_ms = int(time.time() * 1000)
             downstream_region = args.downstream_region
+            rest_rows = 0
 
             for row in rows:
                 exchange_event_ms = int(row.get("exchange_event_ms", 0) or 0)
                 service_ingest_ms = int(row.get("service_ingest_ms", 0) or 0)
                 service_publish_ms = int(row.get("service_publish_ms", 0) or 0)
                 service_region = row.get("service_region")
+                if row.get("source") == "rest":
+                    rest_rows += 1
 
                 if exchange_event_ms:
                     e2e_values.append(float(now_ms - exchange_event_ms))
@@ -91,12 +104,26 @@ async def _collect_samples(args: argparse.Namespace) -> tuple[list[float], list[
                     if service_region == downstream_region:
                         region_aligned_cnt += 1
 
-    return e2e_values, e2s_values, s2d_values, region_aligned_cnt, region_known_cnt
+            if rows:
+                expected = max(0, args.expected_symbols)
+                missing = max(0, expected - len(rows)) if expected > 0 else 0
+                rest_ratio = (rest_rows / len(rows)) if len(rows) > 0 else 0.0
+                batch_summaries.append(
+                    {
+                        "batch_size": float(len(rows)),
+                        "missing_symbols": float(missing),
+                        "rest_ratio": rest_ratio,
+                    },
+                )
+
+    return e2e_values, e2s_values, s2d_values, region_aligned_cnt, region_known_cnt, batch_summaries
 
 
 def main() -> int:
     args = parse_args()
-    e2e_values, e2s_values, s2d_values, region_aligned_cnt, region_known_cnt = asyncio.run(_collect_samples(args))
+    e2e_values, e2s_values, s2d_values, region_aligned_cnt, region_known_cnt, batch_summaries = asyncio.run(
+        _collect_samples(args),
+    )
 
     e2e_sum = summarize(e2e_values)
     e2s_sum = summarize(e2s_values)
@@ -112,6 +139,26 @@ def main() -> int:
         warnings.append(f"exchange_to_service p95 too high: {e2s_sum['p95']:.2f}ms > {args.warn_e2s_p95_ms}ms")
     if s2d_sum["p95"] > args.warn_s2d_p95_ms:
         warnings.append(f"service_to_downstream p95 too high: {s2d_sum['p95']:.2f}ms > {args.warn_s2d_p95_ms}ms")
+    if len(batch_summaries) < args.required_batches:
+        warnings.append(f"batch sample too small: {len(batch_summaries)} < {args.required_batches}")
+
+    batch_with_excess_missing = 0
+    batch_with_excess_rest = 0
+    for b in batch_summaries:
+        if args.expected_symbols > 0 and b["missing_symbols"] > args.max_missing_symbols:
+            batch_with_excess_missing += 1
+        if b["rest_ratio"] > args.max_rest_ratio:
+            batch_with_excess_rest += 1
+    if batch_with_excess_missing > 0:
+        warnings.append(
+            f"missing_symbols exceeded in {batch_with_excess_missing} batches "
+            f"(max_missing_symbols={args.max_missing_symbols})",
+        )
+    if batch_with_excess_rest > 0:
+        warnings.append(
+            f"rest_ratio exceeded in {batch_with_excess_rest} batches "
+            f"(max_rest_ratio={args.max_rest_ratio})",
+        )
 
     report = {
         "event": "latency.summary",
@@ -122,6 +169,15 @@ def main() -> int:
         "service_to_downstream_ms": s2d_sum,
         "end_to_end_ms": e2e_sum,
         "region_alignment_ratio": region_aligned_ratio,
+        "batch_summary": {
+            "batch_count": len(batch_summaries),
+            "required_batches": args.required_batches,
+            "expected_symbols": args.expected_symbols,
+            "max_missing_symbols": args.max_missing_symbols,
+            "max_rest_ratio": args.max_rest_ratio,
+            "excess_missing_batches": batch_with_excess_missing,
+            "excess_rest_ratio_batches": batch_with_excess_rest,
+        },
         "warnings": warnings,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))

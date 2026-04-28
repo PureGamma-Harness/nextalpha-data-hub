@@ -9,7 +9,7 @@ ServiceMode = Literal["alerts", "klines", "all"]
 
 
 class BinanceConfig(BaseModel):
-    ws_base: str = "wss://fstream.binance.com/stream"
+    ws_base: str = "wss://fstream.binance.com/market/stream"
     rest_base: str = "https://fapi.binance.com"
     symbols_refresh_seconds: int = 1800
     # Optional explicit proxy for WS socket connection.
@@ -73,11 +73,15 @@ class WebSocketPushConfig(BaseModel):
     alerts_port: int = 8765
     klines_port: int = 8766
     klines_interval: str = "5m"
+    klines_ws_batch_size: int = 200
     klines_replay_count: int = 3
     klines_flush_grace_ms: int = 20_000
     klines_full_batch_only: bool = False
     klines_full_batch_max_wait_ms: int = 120_000
     klines_min_publish_ratio: float = 1.0
+    # In full-batch mode, optionally allow publishing after max wait
+    # when missing symbols are within this count.
+    klines_max_missing_symbols: int = 0
     # 0 means auto by interval: 5m->2min, 1h->10min
     klines_rest_repair_delay_ms: int = 0
     # Emit full missing symbol list for each published batch

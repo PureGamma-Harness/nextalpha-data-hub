@@ -5,7 +5,7 @@ service_region: ap-northeast-1
 log_level: INFO
 
 binance:
-  ws_base: wss://fstream.binance.com/stream
+  ws_base: wss://fstream.binance.com/market/stream
   rest_base: https://fapi.binance.com
   symbols_refresh_seconds: 1800
   ws_watchdog_enabled: true
@@ -16,9 +16,8 @@ binance:
   # 避免 watchdog 在首次 close 前就触发重连。
   ws_watchdog_no_data_periods: 2
   ws_watchdog_check_seconds: 15
-  use_test_symbols: true
-  test_symbols:
-    - BTCUSDT
+  use_test_symbols: false
+  test_symbols: []
 
 backfill:
   enabled: true
@@ -30,7 +29,7 @@ backfill:
   klines_limit_cap: 1500
 
 redis:
-  url: redis://127.0.0.1:6379/5
+  url: redis://host.docker.internal:6379/5
   key_prefix: "nw:"
   stream_1h_closed: stream:kline:1h:closed
   stream_downstream_ack: stream:kline:1h:ack
@@ -49,8 +48,8 @@ alerts:
   cooldown_seconds: 900
 
 webhook:
-  enabled: false
-  url: ""
+  enabled: true
+  url: "https://open.larksuite.com/open-apis/bot/v2/hook/7187f951-2496-4c16-a026-4cb67bf9ef77"
 
 latency:
   e2e_warn_ms: 1500
@@ -66,15 +65,21 @@ websocket:
   klines_port: 8766
   # 当前联调阶段使用 5m；生产切换为 1h
   klines_interval: 5m
+  # 降低单连接瞬时负载，优化收盘时尾延迟
+  klines_ws_batch_size: 200
   klines_replay_count: 3
-  # 非阻塞模式：收盘后按 WS 到达尽快推送，不等待“全量达标”
-  klines_full_batch_only: false
+  # 全量模式：优先等全量；达到等待上限后可按容忍缺失阈值放行
+  klines_full_batch_only: true
+  # 等待上限后，缺失<=10 视作可接受并放行
+  klines_max_missing_symbols: 10
+  # 最长等待 1.2s，超时且缺失<=10 则放行；否则走 REST 修补
+  klines_full_batch_max_wait_ms: 1200
   # 收盘后最短等待窗口（给慢一点的symbol留一点时间），超时即推
   klines_flush_grace_ms: 5000
-  # 达标推送比例（0~1），例如 0.9 表示达到 90% 可提前触发推送
-  klines_min_publish_ratio: 0.9
-  # REST 仅用于修复缺失：5m联调延迟2分钟后再补
-  klines_rest_repair_delay_ms: 120000
+  # 达标推送比例（0~1）；1.0 表示必须全量才推送
+  klines_min_publish_ratio: 1.0
+  # REST 用于修复缺失：等待 3s 后开始补齐
+  klines_rest_repair_delay_ms: 3000
   # 打印每个批次的完整缺失symbol列表（默认开启，便于对账）
   klines_log_full_missing_symbols: true
   # WS 长时间静默时是否启用 REST 兜底修复（实盘追求低延迟可改为 false）

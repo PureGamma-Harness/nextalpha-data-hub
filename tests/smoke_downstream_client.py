@@ -14,6 +14,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8766/ws/klines")
     parser.add_argument("--max-messages", type=int, default=0, help="0 means run forever")
+    parser.add_argument("--downstream-region", default="ap-northeast-1")
+    parser.add_argument(
+        "--ack-enabled",
+        action="store_true",
+        help="Send ack payloads back to service over the same websocket",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +76,7 @@ async def _run() -> None:
                             ensure_ascii=False,
                         ),
                     )
+                    ack_items: list[dict] = []
                     for row in rows:
                         exchange_event_ms = int(row.get("exchange_event_ms", 0) or 0)
                         service_publish_ms = int(row.get("service_publish_ms", 0) or 0)
@@ -86,10 +93,29 @@ async def _run() -> None:
                                 ensure_ascii=False,
                             ),
                         )
+                        event_id = row.get("event_id")
+                        if args.ack_enabled and event_id:
+                            ack_items.append(
+                                {
+                                    "event_id": event_id,
+                                    "downstream_receive_ms": now_ms,
+                                    "downstream_region": args.downstream_region,
+                                },
+                            )
                         seen += 1
                         if args.max_messages > 0 and seen >= args.max_messages:
                             stop = True
                             break
+                    if args.ack_enabled and ack_items:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "ack_batch",
+                                    "acks": ack_items,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
         except Exception as exc:
             if stop:
                 break

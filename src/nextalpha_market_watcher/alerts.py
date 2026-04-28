@@ -24,6 +24,8 @@ class AlertSignal:
     close_time_ms: int
     event_time_ms: int
     ingest_time_ms: int
+    reference_close_price: str
+    current_close_price: str
 
 
 class AlertEngine:
@@ -86,6 +88,10 @@ class AlertEngine:
         if len(buf) < bars:
             return None
         window = list(buf)[-bars:]
+        if not self._is_contiguous_1m_window(window):
+            # Skip alert evaluation when 1m bars are not continuous.
+            # This avoids false positives/negatives after transient WS gaps.
+            return None
         open_price = window[0].open_price
         close_price = window[-1].close_price
         if open_price == 0:
@@ -95,7 +101,7 @@ class AlertEngine:
         if abs(pct) < Decimal(str(threshold_pct)):
             return None
 
-        direction = "up" if pct > 0 else "down"
+        direction = "上涨" if pct > 0 else "下跌"
         now = int(time.time())
         key = f"{symbol}:{interval}:{direction}"
         expire_at = self._cooldown.get(key, 0)
@@ -104,11 +110,16 @@ class AlertEngine:
         self._cooldown[key] = now + self._cfg.alerts.cooldown_seconds
 
         msg = (
-            f"symbol={symbol} interval={interval} move_pct={pct:.4f}% "
-            f"threshold={threshold_pct}% direction={direction}"
+            f"币种：{symbol}\n"
+            f"周期：{interval}\n"
+            f"方向：{direction}\n"
+            f"上一根K线收盘价：{open_price}\n"
+            f"当前对比K线收盘价：{close_price}\n"
+            f"涨跌幅：{pct:.4f}%\n"
+            f"触发阈值：{interval} {threshold_pct}%"
         )
         logger.warning("alert.trigger %s", msg)
-        await self._notifier.send("Kline alert", msg)
+        await self._notifier.send("告警通知", msg)
         return AlertSignal(
             symbol=symbol,
             interval=interval,
@@ -119,6 +130,8 @@ class AlertEngine:
             close_time_ms=window[-1].close_time_ms,
             event_time_ms=latest_1m.event_time_ms,
             ingest_time_ms=latest_1m.ingest_time_ms,
+            reference_close_price=str(open_price),
+            current_close_price=str(close_price),
         )
 
     def _is_interval_close_boundary(self, latest_1m: ClosedKline, bars: int) -> bool:
@@ -128,3 +141,13 @@ class AlertEngine:
         if interval_ms <= 0:
             return False
         return next_ms % interval_ms == 0
+
+    def _is_contiguous_1m_window(self, window: list[ClosedKline]) -> bool:
+        if len(window) <= 1:
+            return True
+        prev_open = window[0].open_time_ms
+        for row in window[1:]:
+            if row.open_time_ms - prev_open != 60_000:
+                return False
+            prev_open = row.open_time_ms
+        return True

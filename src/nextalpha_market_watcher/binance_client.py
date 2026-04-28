@@ -453,6 +453,11 @@ class BinanceClient:
         ws_base = self._cfg.binance.ws_base.split("?", 1)[0].rstrip("/")
         if ws_base.endswith("/stream"):
             stream_base = ws_base
+        elif ws_base.endswith("/ws"):
+            # Support new market endpoint style:
+            #   wss://fstream.binance.com/market/ws
+            # Combined streams should use sibling /stream path.
+            stream_base = f"{ws_base[:-3]}/stream"
         else:
             stream_base = f"{ws_base}/stream"
         url = f"{stream_base}?streams={'/'.join(stream_names)}"

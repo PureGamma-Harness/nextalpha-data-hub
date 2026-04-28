@@ -32,6 +32,7 @@ def create_app(config_path: str, service_mode: ServiceMode | None = None) -> Fas
     app_runtime = App(cfg, alerts_ws=alerts_hub, klines_ws=klines_hub)
     # Reuse existing replay behavior when new client connects.
     klines_hub._on_client_connected = app_runtime._on_klines_client_connected
+    klines_hub._on_client_message = app_runtime._on_klines_client_message
 
     stop_event = asyncio.Event()
     runtime_task: asyncio.Task[None] | None = None

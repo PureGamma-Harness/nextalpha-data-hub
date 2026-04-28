@@ -20,7 +20,13 @@ class Notifier:
             logger.info("notify.skip title=%s body=%s", title, body)
             return
 
-        payload = {"title": title, "text": body}
+        # Lark custom bot expects msg_type/content schema.
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": f"{title}\n{body}",
+            },
+        }
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(self._cfg.url, json=payload)
             resp.raise_for_status()

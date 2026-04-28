@@ -56,7 +56,7 @@ async def main() -> int:
 
                 frames += 1
                 payload = json.loads(raw)
-                data = payload.get("data") if isinstance(payload, dict) else None
+                data = payload.get("data", payload) if isinstance(payload, dict) else None
                 k = data.get("k") if isinstance(data, dict) else None
 
                 if isinstance(k, dict):

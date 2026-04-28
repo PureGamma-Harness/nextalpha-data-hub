@@ -5,15 +5,18 @@ import logging
 import math
 import time
 from collections import deque
+from datetime import datetime
 
 import httpx
 import orjson
+import redis.asyncio as redis
 from fastapi import WebSocket
 from websockets.server import WebSocketServerProtocol
 
 from .alerts import AlertEngine, AlertSignal
 from .binance_client import BinanceClient
 from .config import AppConfig
+from .latency import LatencyEvent
 from .metrics import start_metrics_server
 from .notifier import Notifier
 from .ws_push import WsBroadcaster
@@ -56,6 +59,9 @@ class App:
         self._pending_by_close: dict[int, dict[str, dict]] = {}
         self._pending_has_ws: dict[int, bool] = {}
         self._pending_first_ingest_ms: dict[int, int] = {}
+        self._published_close_times: set[int] = set()
+        self._published_close_order: deque[int] = deque()
+        self._published_close_max = 32
         self._flush_grace_ms = max(1_000, self._cfg.websocket.klines_flush_grace_ms)
         self._full_batch_only = self._cfg.websocket.klines_full_batch_only
         self._min_publish_ratio = min(1.0, max(0.0, self._cfg.websocket.klines_min_publish_ratio))
@@ -63,11 +69,21 @@ class App:
             self._flush_grace_ms,
             self._cfg.websocket.klines_full_batch_max_wait_ms,
         )
+        self._max_missing_symbols = max(0, self._cfg.websocket.klines_max_missing_symbols)
         self._pending_lock = asyncio.Lock()
         self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
+        self._klines_ws_batch_size = max(1, self._cfg.websocket.klines_ws_batch_size)
         self._rest_repair_delay_ms = self._resolve_rest_repair_delay_ms(self._klines_interval)
         self._rest_repairing_close_times: set[int] = set()
         self._log_full_missing_symbols = self._cfg.websocket.klines_log_full_missing_symbols
+        self._pending_latency: dict[str, LatencyEvent] = {}
+        self._pending_latency_lock = asyncio.Lock()
+        self._latency_redis = redis.from_url(cfg.redis.url, decode_responses=True)
+        self._event_close_time: dict[str, int] = {}
+        self._ack_service_to_downstream_by_close: dict[int, list[int]] = {}
+        self._ack_expected_by_close: dict[int, int] = {}
+        self._ack_notify_scheduled: set[int] = set()
+        self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop_event = stop if stop is not None else asyncio.Event()
@@ -153,6 +169,7 @@ class App:
                 *[x for x in to_cancel if x is not None],
                 return_exceptions=True,
             )
+            await self._latency_redis.aclose()
 
     async def _run_ingestion(self, symbols: list[str]) -> None:
         tasks: list[asyncio.Task[None]] = []
@@ -187,13 +204,25 @@ class App:
             return
 
         self._expected_symbols = set(symbols)
-        min_required = max(1, math.ceil(len(self._expected_symbols) * self._min_publish_ratio))
+        expected_symbols = len(self._expected_symbols)
+        # In full-batch mode, always prefer full batch for immediate publish.
+        # Tolerant (missing <= N) publish is handled by max-wait path.
+        if self._full_batch_only:
+            min_required = max(1, expected_symbols)
+        else:
+            min_required = max(1, math.ceil(expected_symbols * self._min_publish_ratio))
         self._pending_by_close.clear()
         self._pending_has_ws.clear()
         self._pending_first_ingest_ms.clear()
+        self._published_close_times.clear()
+        self._published_close_order.clear()
         latest_close_by_symbol: dict[str, int] = {}
 
-        async for kline in self._binance.iter_closed_klines(symbols, interval=self._klines_interval):
+        async for kline in self._binance.iter_closed_klines(
+            symbols,
+            interval=self._klines_interval,
+            batch_size=self._klines_ws_batch_size,
+        ):
             prev_close = latest_close_by_symbol.get(kline.symbol)
             if prev_close is not None and kline.close_time_ms <= prev_close:
                 continue
@@ -201,9 +230,12 @@ class App:
             self._ingest_1h += 1
             complete_rows: dict[str, dict] | None = None
             async with self._pending_lock:
+                if kline.close_time_ms in self._published_close_times:
+                    continue
                 rows_by_symbol = self._pending_by_close.setdefault(kline.close_time_ms, {})
                 self._pending_first_ingest_ms.setdefault(kline.close_time_ms, kline.ingest_time_ms)
                 rows_by_symbol[kline.symbol] = {
+                    "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
                     "symbol": kline.symbol,
                     "interval": kline.interval,
                     "open_time_ms": kline.open_time_ms,
@@ -225,6 +257,7 @@ class App:
                     complete_rows = self._pending_by_close.pop(kline.close_time_ms, {})
                     self._pending_has_ws.pop(kline.close_time_ms, None)
                     first_ingest_ms = self._pending_first_ingest_ms.pop(kline.close_time_ms, None)
+                    self._mark_close_time_published_locked(kline.close_time_ms)
 
             if complete_rows:
                 await self._flush_close_time(kline.close_time_ms, complete_rows, first_ingest_ms)
@@ -235,6 +268,8 @@ class App:
             self._pending_has_ws = {}
             pending_first = self._pending_first_ingest_ms
             self._pending_first_ingest_ms = {}
+            for close_time_ms, _ in pending_items:
+                self._mark_close_time_published_locked(close_time_ms)
 
         for close_time_ms, rows_by_symbol in pending_items:
             missing = len(self._expected_symbols) - len(rows_by_symbol)
@@ -259,6 +294,7 @@ class App:
         publish_ms = int(time.time() * 1000)
         payload = [dict(row, service_publish_ms=publish_ms) for row in rows_by_symbol.values()]
         payload.sort(key=lambda row: row["symbol"])
+        await self._record_published_latency(payload)
         if self._klines_recent.maxlen and self._klines_recent.maxlen > 0:
             async with self._klines_recent_lock:
                 self._klines_recent.append(payload)
@@ -301,6 +337,7 @@ class App:
                 len(missing_list),
                 ",".join(missing_list),
             )
+        await self._notify_kline_batch(payload, expected_symbols, missing_symbols, ws_count, rest_count)
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
@@ -318,6 +355,7 @@ class App:
                 self._pending_has_ws.pop(close_time_ms, None)
                 if rows_by_symbol:
                     first_ingest_ms = self._pending_first_ingest_ms.pop(close_time_ms, None)
+                    self._mark_close_time_published_locked(close_time_ms)
                     stale_batches.append((close_time_ms, rows_by_symbol, first_ingest_ms))
 
         for close_time_ms, rows_by_symbol, first_ingest_ms in stale_batches:
@@ -338,10 +376,52 @@ class App:
             await asyncio.sleep(1)
             now_ms = int(time.time() * 1000)
             if self._full_batch_only:
+                await self._flush_waited_tolerant_batches(now_ms)
                 await self._try_rest_repair_for_waiting_batches(now_ms)
                 await self._log_full_batch_waiting(now_ms)
             else:
                 await self._flush_stale_batches(now_ms)
+
+    async def _flush_waited_tolerant_batches(self, now_ms: int) -> None:
+        if self._klines_ws is None:
+            return
+        if self._max_missing_symbols <= 0:
+            return
+        expected_symbols = len(self._expected_symbols)
+        tolerant_required = max(1, expected_symbols - self._max_missing_symbols)
+        flush_items: list[tuple[int, dict[str, dict], int | None]] = []
+        async with self._pending_lock:
+            candidate_close_times = []
+            for close_time_ms, rows_by_symbol in self._pending_by_close.items():
+                if not self._pending_has_ws.get(close_time_ms, False):
+                    continue
+                first_ingest_ms = self._pending_first_ingest_ms.get(close_time_ms)
+                if first_ingest_ms is None:
+                    continue
+                wait_ms = max(0, now_ms - first_ingest_ms)
+                got = len(rows_by_symbol)
+                if wait_ms >= self._full_batch_max_wait_ms and got >= tolerant_required:
+                    candidate_close_times.append(close_time_ms)
+            for close_time_ms in sorted(candidate_close_times):
+                rows_by_symbol = self._pending_by_close.pop(close_time_ms, {})
+                self._pending_has_ws.pop(close_time_ms, None)
+                first_ingest_ms = self._pending_first_ingest_ms.pop(close_time_ms, None)
+                if rows_by_symbol:
+                    self._mark_close_time_published_locked(close_time_ms)
+                    flush_items.append((close_time_ms, rows_by_symbol, first_ingest_ms))
+
+        for close_time_ms, rows_by_symbol, first_ingest_ms in flush_items:
+            missing = max(0, expected_symbols - len(rows_by_symbol))
+            logger.warning(
+                "klines.batch.max_wait_tolerant_flush close_time_ms=%s got=%s expected=%s missing=%s max_missing_symbols=%s max_wait_ms=%s",
+                close_time_ms,
+                len(rows_by_symbol),
+                expected_symbols,
+                missing,
+                self._max_missing_symbols,
+                self._full_batch_max_wait_ms,
+            )
+            await self._flush_close_time(close_time_ms, rows_by_symbol, first_ingest_ms)
 
     async def _try_rest_repair_for_waiting_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
@@ -418,6 +498,7 @@ class App:
                     if rows_now is None or symbol in rows_now:
                         continue
                     rows_now[symbol] = {
+                        "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
                         "symbol": kline.symbol,
                         "interval": kline.interval,
                         "open_time_ms": kline.open_time_ms,
@@ -443,6 +524,7 @@ class App:
                 maybe_flush_rows = self._pending_by_close.pop(close_time_ms, {})
                 self._pending_has_ws.pop(close_time_ms, None)
                 first_ingest_ms = self._pending_first_ingest_ms.pop(close_time_ms, first_ingest_ms)
+                self._mark_close_time_published_locked(close_time_ms)
         logger.warning(
             "klines.batch.rest_repair.done close_time_ms=%s repaired=%s got_symbols=%s min_required=%s",
             close_time_ms,
@@ -497,6 +579,15 @@ class App:
         # default fallback for other intervals: 2 minutes
         return 120_000
 
+    def _mark_close_time_published_locked(self, close_time_ms: int) -> None:
+        if close_time_ms in self._published_close_times:
+            return
+        self._published_close_times.add(close_time_ms)
+        self._published_close_order.append(close_time_ms)
+        while len(self._published_close_order) > self._published_close_max:
+            expired = self._published_close_order.popleft()
+            self._published_close_times.discard(expired)
+
     async def _on_klines_client_connected(self, ws: WebSocketServerProtocol | WebSocket) -> None:
         if self._klines_recent.maxlen == 0:
             return
@@ -522,6 +613,237 @@ class App:
             except Exception:
                 break
         logger.info("ws.client.replay name=klines replayed=%s", sent)
+
+    async def _record_published_latency(self, payload: list[dict]) -> None:
+        if not payload:
+            return
+        stream = self._cfg.redis.stream_latency_events
+        cap = self._cfg.redis.pending_latency_max
+        for row in payload:
+            event_id = str(row.get("event_id") or "")
+            if not event_id:
+                continue
+            try:
+                close_time_ms = int(row.get("close_time_ms") or 0)
+            except (TypeError, ValueError):
+                close_time_ms = 0
+            try:
+                ev = LatencyEvent(
+                    event_id=event_id,
+                    symbol=str(row.get("symbol") or ""),
+                    interval=str(row.get("interval") or ""),
+                    exchange_event_ms=int(row.get("exchange_event_ms") or 0),
+                    service_ingest_ms=int(row.get("service_ingest_ms") or 0),
+                    service_publish_ms=int(row.get("service_publish_ms") or 0),
+                    service_region=self._cfg.service_region,
+                )
+            except (TypeError, ValueError):
+                continue
+            async with self._pending_latency_lock:
+                while len(self._pending_latency) >= cap:
+                    drop = next(iter(self._pending_latency))
+                    self._pending_latency.pop(drop, None)
+                self._pending_latency[event_id] = ev
+                if close_time_ms > 0:
+                    self._event_close_time[event_id] = close_time_ms
+            try:
+                await self._latency_redis.xadd(
+                    stream,
+                    fields={
+                        "event_id": ev.event_id,
+                        "symbol": ev.symbol,
+                        "interval": ev.interval,
+                        "exchange_to_service_ms": str(ev.exchange_to_service_ms()),
+                        "service_region": ev.service_region,
+                        "phase": "published",
+                    },
+                    maxlen=self._cfg.redis.stream_maxlen,
+                    approximate=True,
+                )
+            except Exception:
+                logger.exception("latency.published.persist_failed event_id=%s", event_id)
+        if payload:
+            try:
+                close_time_ms = int(payload[0].get("close_time_ms") or 0)
+            except (TypeError, ValueError):
+                close_time_ms = 0
+            if close_time_ms > 0:
+                self._ack_expected_by_close[close_time_ms] = len(payload)
+                self._ack_service_to_downstream_by_close.setdefault(close_time_ms, [])
+                if close_time_ms not in self._ack_notify_scheduled:
+                    self._ack_notify_scheduled.add(close_time_ms)
+                    asyncio.create_task(self._notify_ack_summary_later(close_time_ms, delay_seconds=20))
+
+    async def _on_klines_client_message(self, _ws: WebSocket, message: str) -> None:
+        try:
+            payload = orjson.loads(message)
+        except Exception:
+            return
+
+        ack_items: list[dict] = []
+        if isinstance(payload, dict):
+            if "event_id" in payload:
+                ack_items = [payload]
+            elif isinstance(payload.get("acks"), list):
+                ack_items = [x for x in payload["acks"] if isinstance(x, dict)]
+        elif isinstance(payload, list):
+            ack_items = [x for x in payload if isinstance(x, dict)]
+
+        if not ack_items:
+            return
+        for item in ack_items:
+            await self._apply_downstream_ack(item)
+
+    async def _apply_downstream_ack(self, item: dict) -> None:
+        event_id = str(item.get("event_id") or "")
+        if not event_id:
+            return
+        try:
+            downstream_receive_ms = int(item.get("downstream_receive_ms"))
+        except (TypeError, ValueError):
+            return
+        downstream_region = str(item.get("downstream_region") or "")
+
+        async with self._pending_latency_lock:
+            ev = self._pending_latency.pop(event_id, None)
+            close_time_ms = self._event_close_time.pop(event_id, None)
+        if ev is None:
+            logger.info("ack.unknown event_id=%s", event_id)
+            return
+
+        ev.downstream_receive_ms = downstream_receive_ms
+        ev.downstream_region = downstream_region or None
+        e2e = ev.end_to_end_ms()
+        svc_to_downstream = ev.service_to_downstream_ms()
+        region_ok = ev.region_aligned()
+        logger.info(
+            "latency.final event_id=%s symbol=%s e2e_ms=%s exchange_to_service_ms=%s "
+            "service_to_downstream_ms=%s service_region=%s downstream_region=%s region_aligned=%s",
+            ev.event_id,
+            ev.symbol,
+            e2e,
+            ev.exchange_to_service_ms(),
+            svc_to_downstream,
+            ev.service_region,
+            ev.downstream_region,
+            region_ok,
+        )
+        if close_time_ms is not None and svc_to_downstream is not None:
+            self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
+        try:
+            await self._latency_redis.xadd(
+                self._cfg.redis.stream_latency_events,
+                fields={
+                    "event_id": ev.event_id,
+                    "symbol": ev.symbol,
+                    "interval": ev.interval,
+                    "e2e_ms": str(e2e),
+                    "exchange_to_service_ms": str(ev.exchange_to_service_ms()),
+                    "service_to_downstream_ms": str(svc_to_downstream),
+                    "service_region": ev.service_region,
+                    "downstream_region": ev.downstream_region or "",
+                    "region_aligned": str(region_ok),
+                    "phase": "ack",
+                },
+                maxlen=self._cfg.redis.stream_maxlen,
+                approximate=True,
+            )
+        except Exception:
+            logger.exception("latency.ack.persist_failed event_id=%s", event_id)
+
+    async def _notify_kline_batch(
+        self,
+        payload: list[dict],
+        expected_symbols: int,
+        missing_symbols: int,
+        ws_count: int,
+        rest_count: int,
+    ) -> None:
+        if not payload:
+            return
+        b2s_values: list[int] = []
+        s2p_values: list[int] = []
+        for row in payload:
+            try:
+                exchange_event_ms = int(row.get("exchange_event_ms") or 0)
+                service_ingest_ms = int(row.get("service_ingest_ms") or 0)
+                service_publish_ms = int(row.get("service_publish_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if exchange_event_ms and service_ingest_ms:
+                b2s_values.append(service_ingest_ms - exchange_event_ms)
+            if service_ingest_ms and service_publish_ms:
+                s2p_values.append(service_publish_ms - service_ingest_ms)
+        close_time_ms = payload[0].get("close_time_ms")
+        try:
+            close_time_key = int(close_time_ms or 0)
+        except (TypeError, ValueError):
+            close_time_key = 0
+        if close_time_key <= 0:
+            return
+        self._batch_summary_by_close[close_time_key] = {
+            "close_time_ms": close_time_key,
+            "batch_size": len(payload),
+            "expected_symbols": expected_symbols,
+            "missing_symbols": max(0, missing_symbols),
+            "ws_count": ws_count,
+            "rest_count": rest_count,
+            "binance_to_service": self._format_stats(b2s_values),
+            "service_ingest_to_publish": self._format_stats(s2p_values),
+        }
+
+    async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
+        await asyncio.sleep(max(1, delay_seconds))
+        expected = self._ack_expected_by_close.get(close_time_ms, 0)
+        values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
+        batch = self._batch_summary_by_close.get(close_time_ms, {})
+        body = (
+            "【K线批次与ACK汇总】\n"
+            f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
+            f"推送数量：{batch.get('batch_size', expected)}\n"
+            f"期望总数：{batch.get('expected_symbols', expected)}\n"
+            f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
+            f"WS条数：{batch.get('ws_count', 0)}\n"
+            f"REST条数：{batch.get('rest_count', 0)}\n"
+            f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
+            f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
+            f"ACK已回执：{len(values)}\n"
+            f"ACK期望总数：{expected}\n"
+            f"服务端到客户端(ACK)：{self._format_stats(values)}"
+        )
+        await self._notifier.send("K线批次与ACK汇总", body)
+        self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
+        self._ack_expected_by_close.pop(close_time_ms, None)
+        self._batch_summary_by_close.pop(close_time_ms, None)
+        self._ack_notify_scheduled.discard(close_time_ms)
+
+    def _format_stats(self, values: list[int]) -> str:
+        if not values:
+            return "n=0"
+        values_sorted = sorted(values)
+        avg = sum(values_sorted) / len(values_sorted)
+        p95 = self._percentile(values_sorted, 95.0)
+        return f"n={len(values_sorted)} avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
+
+    def _format_close_time(self, close_time_ms: object) -> str:
+        try:
+            ts_ms = int(close_time_ms)
+        except (TypeError, ValueError):
+            return str(close_time_ms)
+        if ts_ms <= 0:
+            return str(close_time_ms)
+        return datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _percentile(self, values_sorted: list[int], pct: float) -> float:
+        if not values_sorted:
+            return 0.0
+        rank = (len(values_sorted) - 1) * (pct / 100.0)
+        lo = int(rank)
+        hi = min(lo + 1, len(values_sorted) - 1)
+        if lo == hi:
+            return float(values_sorted[lo])
+        frac = rank - lo
+        return values_sorted[lo] + (values_sorted[hi] - values_sorted[lo]) * frac
 
     async def _run_1m_alerts(self, symbols: list[str]) -> None:
         if self._alerts is None:
@@ -569,6 +891,8 @@ class App:
             "direction": signal.direction,
             "threshold_pct": signal.threshold_pct,
             "move_pct": signal.move_pct,
+            "previous_close": signal.reference_close_price,
+            "current_close": signal.current_close_price,
             "open_time_ms": signal.open_time_ms,
             "close_time_ms": signal.close_time_ms,
             "exchange_event_ms": signal.event_time_ms,

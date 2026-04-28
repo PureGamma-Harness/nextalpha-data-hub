@@ -24,9 +24,11 @@ class FastAPIWsHub:
         self,
         name: str,
         on_client_connected: Callable[[WebSocket], Awaitable[None]] | None = None,
+        on_client_message: Callable[[WebSocket, str], Awaitable[None]] | None = None,
     ) -> None:
         self._name = name
         self._on_client_connected = on_client_connected
+        self._on_client_message = on_client_message
         self._clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
 
@@ -58,7 +60,13 @@ class FastAPIWsHub:
         """
         try:
             while True:
-                await ws.receive_text()
+                message = await ws.receive_text()
+                if self._on_client_message is None:
+                    continue
+                try:
+                    await self._on_client_message(ws, message)
+                except Exception:
+                    logger.exception("ws.client.message.failed name=%s", self._name)
         except Exception:
             return
 

@@ -3,7 +3,7 @@ service_region: ap-northeast-1
 log_level: INFO
 
 binance:
-  ws_base: wss://fstream.binance.com/stream
+  ws_base: wss://fstream.binance.com/market/stream
   rest_base: https://fapi.binance.com
   symbols_refresh_seconds: 1800
   ws_watchdog_enabled: true
@@ -42,8 +42,8 @@ alerts:
   cooldown_seconds: 900
 
 webhook:
-  enabled: false
-  url: ""
+  enabled: true
+  url: "https://open.larksuite.com/open-apis/bot/v2/hook/7187f951-2496-4c16-a026-4cb67bf9ef77"
 
 latency:
   e2e_warn_ms: 1500
@@ -58,10 +58,13 @@ websocket:
   alerts_port: 8765
   klines_port: 8766
   klines_interval: 5m
+  klines_ws_batch_size: 200
   klines_replay_count: 3
-  klines_full_batch_only: false
+  klines_full_batch_only: true
+  klines_max_missing_symbols: 10
+  klines_full_batch_max_wait_ms: 1200
   klines_flush_grace_ms: 5000
-  klines_min_publish_ratio: 0.9
-  klines_rest_repair_delay_ms: 600000
+  klines_min_publish_ratio: 1.0
+  klines_rest_repair_delay_ms: 3000
   klines_log_full_missing_symbols: true
   klines_ws_silence_fallback_rest: false
