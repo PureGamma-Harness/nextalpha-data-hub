@@ -50,8 +50,3 @@ services:
         hard: 65535
     volumes:
       - ./config.prod.yaml:/app/config.yaml:ro
-services:
-  # 预留生产覆盖项（例如镜像 tag、端口、资源限制、日志策略）。
-  # 当前版本无需额外覆盖，保留文件用于后续扩展。
-  market-watcher-alerts: {}
-  market-watcher-klines: {}
