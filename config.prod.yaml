@@ -57,7 +57,7 @@ websocket:
   host: 0.0.0.0
   alerts_port: 8765
   klines_port: 8766
-  klines_interval: 5m
+  klines_interval: 1h
   # 分片模式：每条WS连接承载约200个symbol
   klines_ws_batch_size: 200
   klines_replay_count: 3
