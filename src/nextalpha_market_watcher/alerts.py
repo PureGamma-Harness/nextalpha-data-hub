@@ -5,6 +5,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal
+from collections.abc import Awaitable, Callable
 
 from .config import AppConfig
 from .models import ClosedKline
@@ -29,9 +30,15 @@ class AlertSignal:
 
 
 class AlertEngine:
-    def __init__(self, cfg: AppConfig, notifier: Notifier) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        notifier: Notifier,
+        alert_clients_count_getter: Callable[[], Awaitable[int]] | None = None,
+    ) -> None:
         self._cfg = cfg
         self._notifier = notifier
+        self._alert_clients_count_getter = alert_clients_count_getter
         self._history: dict[str, deque[ClosedKline]] = defaultdict(
             lambda: deque(maxlen=cfg.redis.one_m_ring_max_bars),
         )
@@ -103,6 +110,12 @@ class AlertEngine:
 
         direction = "up" if pct > 0 else "down"
         direction_text = "上涨" if direction == "up" else "下跌"
+        alert_clients = 0
+        if self._alert_clients_count_getter is not None:
+            try:
+                alert_clients = max(0, int(await self._alert_clients_count_getter()))
+            except Exception:
+                alert_clients = 0
         now = int(time.time())
         key = f"{symbol}:{interval}:{direction}"
         expire_at = self._cooldown.get(key, 0)
@@ -117,7 +130,8 @@ class AlertEngine:
             f"上一根K线收盘价：{open_price}\n"
             f"当前对比K线收盘价：{close_price}\n"
             f"涨跌幅：{pct:.4f}%\n"
-            f"触发阈值：{interval} {threshold_pct}%"
+            f"触发阈值：{interval} {threshold_pct}%\n"
+            f"告警客户端连接数：{alert_clients}"
         )
         logger.warning("alert.trigger %s", msg)
         try:

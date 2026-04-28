@@ -35,7 +35,7 @@ class App:
         self._notifier = Notifier(cfg.webhook)
         self._alerts: AlertEngine | None = None
         if cfg.service_mode in ("alerts", "all"):
-            self._alerts = AlertEngine(cfg, self._notifier)
+            self._alerts = AlertEngine(cfg, self._notifier, self._get_alert_clients_count)
         self._binance = BinanceClient(cfg)
         self._alerts_ws: object | None = alerts_ws
         self._klines_ws: object | None = klines_ws
@@ -79,6 +79,7 @@ class App:
         self._event_close_time: dict[str, int] = {}
         self._ack_service_to_downstream_by_close: dict[int, list[int]] = {}
         self._ack_expected_by_close: dict[int, int] = {}
+        self._ack_clients_by_close: dict[int, set[int]] = {}
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
 
@@ -343,6 +344,7 @@ class App:
             ws_count,
             rest_count,
             service_to_client_no_ack_ms,
+            pushed_clients,
         )
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
@@ -697,10 +699,11 @@ class App:
 
         if not ack_items:
             return
+        sender_client_id = id(_ws)
         for item in ack_items:
-            await self._apply_downstream_ack(item)
+            await self._apply_downstream_ack(item, sender_client_id)
 
-    async def _apply_downstream_ack(self, item: dict) -> None:
+    async def _apply_downstream_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         event_id = str(item.get("event_id") or "")
         if not event_id:
             return
@@ -736,6 +739,8 @@ class App:
         )
         if close_time_ms is not None and svc_to_downstream is not None:
             self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
+            if sender_client_id is not None:
+                self._ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
         try:
             await self._latency_redis.xadd(
                 self._cfg.redis.stream_latency_events,
@@ -765,6 +770,7 @@ class App:
         ws_count: int,
         rest_count: int,
         service_to_client_no_ack_ms: int,
+        connected_clients: int,
     ) -> None:
         if not payload:
             return
@@ -798,12 +804,14 @@ class App:
             "binance_to_service": self._format_stats(b2s_values),
             "service_ingest_to_publish": self._format_stats(s2p_values),
             "service_to_client_no_ack": self._format_stats([service_to_client_no_ack_ms] * len(payload)),
+            "connected_clients": max(0, connected_clients),
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
         await asyncio.sleep(max(1, delay_seconds))
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
+        ack_clients = len(self._ack_clients_by_close.get(close_time_ms, set()))
         batch = self._batch_summary_by_close.get(close_time_ms, {})
         body = (
             "【K线批次与ACK汇总】\n"
@@ -816,6 +824,8 @@ class App:
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
+            f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
+            f"ACK上报客户端数：{ack_clients}\n"
             f"ACK已回执：{len(values)}\n"
             f"ACK期望总数：{expected}\n"
             f"服务端到客户端(ACK)：{self._format_stats(values)}"
@@ -827,16 +837,21 @@ class App:
         finally:
             self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
             self._ack_expected_by_close.pop(close_time_ms, None)
+            self._ack_clients_by_close.pop(close_time_ms, None)
             self._batch_summary_by_close.pop(close_time_ms, None)
             self._ack_notify_scheduled.discard(close_time_ms)
 
     def _format_stats(self, values: list[int]) -> str:
         if not values:
             return "n=0"
+        current = values[-1]
         values_sorted = sorted(values)
         avg = sum(values_sorted) / len(values_sorted)
         p95 = self._percentile(values_sorted, 95.0)
-        return f"n={len(values_sorted)} avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
+        return (
+            f"n={len(values_sorted)} 本次={current}ms "
+            f"avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
+        )
 
     def _format_close_time(self, close_time_ms: object) -> str:
         try:
@@ -912,3 +927,14 @@ class App:
             "service_ingest_ms": signal.ingest_time_ms,
             "service_region": self._cfg.service_region,
         }
+
+    async def _get_alert_clients_count(self) -> int:
+        if self._alerts_ws is None:
+            return 0
+        client_count = getattr(self._alerts_ws, "client_count", None)
+        if callable(client_count):
+            try:
+                return int(await client_count())
+            except Exception:
+                return 0
+        return 0
