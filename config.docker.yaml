@@ -65,7 +65,7 @@ websocket:
   klines_port: 8766
   # 当前联调阶段使用 5m；生产切换为 1h
   klines_interval: 5m
-  # 降低单连接瞬时负载，优化收盘时尾延迟
+  # 分片模式：每条WS连接承载约200个symbol
   klines_ws_batch_size: 200
   klines_replay_count: 3
   # 全量模式：优先等全量；达到等待上限后可按容忍缺失阈值放行
