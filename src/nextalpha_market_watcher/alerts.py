@@ -101,7 +101,8 @@ class AlertEngine:
         if abs(pct) < Decimal(str(threshold_pct)):
             return None
 
-        direction = "上涨" if pct > 0 else "下跌"
+        direction = "up" if pct > 0 else "down"
+        direction_text = "上涨" if direction == "up" else "下跌"
         now = int(time.time())
         key = f"{symbol}:{interval}:{direction}"
         expire_at = self._cooldown.get(key, 0)
@@ -112,14 +113,18 @@ class AlertEngine:
         msg = (
             f"币种：{symbol}\n"
             f"周期：{interval}\n"
-            f"方向：{direction}\n"
+            f"方向：{direction_text}\n"
             f"上一根K线收盘价：{open_price}\n"
             f"当前对比K线收盘价：{close_price}\n"
             f"涨跌幅：{pct:.4f}%\n"
             f"触发阈值：{interval} {threshold_pct}%"
         )
         logger.warning("alert.trigger %s", msg)
-        await self._notifier.send("告警通知", msg)
+        try:
+            await self._notifier.send("告警通知", msg)
+        except Exception:
+            # Notification failure should not interrupt core alert ingestion.
+            logger.exception("alert.notify_failed symbol=%s interval=%s direction=%s", symbol, interval, direction)
         return AlertSignal(
             symbol=symbol,
             interval=interval,

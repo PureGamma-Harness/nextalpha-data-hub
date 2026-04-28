@@ -65,10 +65,7 @@ class App:
         self._flush_grace_ms = max(1_000, self._cfg.websocket.klines_flush_grace_ms)
         self._full_batch_only = self._cfg.websocket.klines_full_batch_only
         self._min_publish_ratio = min(1.0, max(0.0, self._cfg.websocket.klines_min_publish_ratio))
-        self._full_batch_max_wait_ms = max(
-            self._flush_grace_ms,
-            self._cfg.websocket.klines_full_batch_max_wait_ms,
-        )
+        self._full_batch_max_wait_ms = max(1_000, self._cfg.websocket.klines_full_batch_max_wait_ms)
         self._max_missing_symbols = max(0, self._cfg.websocket.klines_max_missing_symbols)
         self._pending_lock = asyncio.Lock()
         self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
@@ -299,6 +296,8 @@ class App:
             async with self._klines_recent_lock:
                 self._klines_recent.append(payload)
         pushed_clients = await self._klines_ws.broadcast_json(payload)
+        push_done_ms = int(time.time() * 1000)
+        service_to_client_no_ack_ms = max(0, push_done_ms - publish_ms)
         if pushed_clients > 0:
             self._push_1h += pushed_clients * len(payload)
         got_symbols = len(rows_by_symbol)
@@ -337,7 +336,14 @@ class App:
                 len(missing_list),
                 ",".join(missing_list),
             )
-        await self._notify_kline_batch(payload, expected_symbols, missing_symbols, ws_count, rest_count)
+        await self._notify_kline_batch(
+            payload,
+            expected_symbols,
+            missing_symbols,
+            ws_count,
+            rest_count,
+            service_to_client_no_ack_ms,
+        )
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
@@ -758,6 +764,7 @@ class App:
         missing_symbols: int,
         ws_count: int,
         rest_count: int,
+        service_to_client_no_ack_ms: int,
     ) -> None:
         if not payload:
             return
@@ -790,6 +797,7 @@ class App:
             "rest_count": rest_count,
             "binance_to_service": self._format_stats(b2s_values),
             "service_ingest_to_publish": self._format_stats(s2p_values),
+            "service_to_client_no_ack": self._format_stats([service_to_client_no_ack_ms] * len(payload)),
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
@@ -807,15 +815,20 @@ class App:
             f"REST条数：{batch.get('rest_count', 0)}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
+            f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
             f"ACK已回执：{len(values)}\n"
             f"ACK期望总数：{expected}\n"
             f"服务端到客户端(ACK)：{self._format_stats(values)}"
         )
-        await self._notifier.send("K线批次与ACK汇总", body)
-        self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
-        self._ack_expected_by_close.pop(close_time_ms, None)
-        self._batch_summary_by_close.pop(close_time_ms, None)
-        self._ack_notify_scheduled.discard(close_time_ms)
+        try:
+            await self._notifier.send("K线批次与ACK汇总", body)
+        except Exception:
+            logger.exception("notify.ack_summary_failed close_time_ms=%s", close_time_ms)
+        finally:
+            self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
+            self._ack_expected_by_close.pop(close_time_ms, None)
+            self._batch_summary_by_close.pop(close_time_ms, None)
+            self._ack_notify_scheduled.discard(close_time_ms)
 
     def _format_stats(self, values: list[int]) -> str:
         if not values:
