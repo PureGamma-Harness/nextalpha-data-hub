@@ -1,0 +1,67 @@
+app_name: nextalpha-market-watcher
+service_region: ap-northeast-1
+log_level: INFO
+
+binance:
+  ws_base: wss://fstream.binance.com/stream
+  rest_base: https://fapi.binance.com
+  symbols_refresh_seconds: 1800
+  ws_watchdog_enabled: true
+  ws_proxy_url: null
+  ws_watchdog_no_data_periods: 2
+  ws_watchdog_check_seconds: 15
+  use_test_symbols: false
+  test_symbols: []
+
+backfill:
+  enabled: true
+  rest_timeout_seconds: 15.0
+  rest_concurrency: 8
+  rest_request_delay_seconds: 0.02
+  bars_1m: 32
+  bars_1h: 3
+  klines_limit_cap: 1500
+
+redis:
+  url: redis://172.33.178.40:6379/5
+  key_prefix: "nw:"
+  stream_1h_closed: stream:kline:1h:closed
+  stream_downstream_ack: stream:kline:1h:ack
+  stream_latency_events: stream:latency:events
+  stream_maxlen: 200000
+  published_1h_ttl_seconds: 32400
+  one_m_ring_max_bars: 480
+  one_m_ring_ttl_seconds: 129600
+  pending_latency_max: 100000
+
+alerts:
+  threshold_1m_pct: 10.0
+  threshold_5m_pct: 15.0
+  threshold_1h_pct: 25.0
+  threshold_4h_pct: 40.0
+  cooldown_seconds: 900
+
+webhook:
+  enabled: false
+  url: ""
+
+latency:
+  e2e_warn_ms: 1500
+
+metrics:
+  enabled: true
+  host: 0.0.0.0
+  port: 9090
+
+websocket:
+  host: 0.0.0.0
+  alerts_port: 8765
+  klines_port: 8766
+  klines_interval: 1h
+  klines_replay_count: 3
+  klines_full_batch_only: false
+  klines_flush_grace_ms: 5000
+  klines_min_publish_ratio: 0.9
+  klines_rest_repair_delay_ms: 600000
+  klines_log_full_missing_symbols: true
+  klines_ws_silence_fallback_rest: false

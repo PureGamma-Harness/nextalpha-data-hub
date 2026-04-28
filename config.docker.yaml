@@ -1,0 +1,81 @@
+# Docker Compose 默认配置。
+# 职责由 compose 的 command --mode 指定（alerts / klines），无需在此写 service_mode。
+app_name: nextalpha-market-watcher
+service_region: ap-northeast-1
+log_level: INFO
+
+binance:
+  ws_base: wss://fstream.binance.com/stream
+  rest_base: https://fapi.binance.com
+  symbols_refresh_seconds: 1800
+  ws_watchdog_enabled: true
+  # WebSocket 显式走代理（容器内通过宿主机 10808 转发）。
+  # 优先用 socks5，通常比 http CONNECT 对 WS 更稳定。
+  ws_proxy_url: socks5://host.docker.internal:10808
+  # 联调期：给第一次收到“已收盘kline”留足窗口
+  # 避免 watchdog 在首次 close 前就触发重连。
+  ws_watchdog_no_data_periods: 2
+  ws_watchdog_check_seconds: 15
+  use_test_symbols: true
+  test_symbols:
+    - BTCUSDT
+
+backfill:
+  enabled: true
+  rest_timeout_seconds: 15.0
+  rest_concurrency: 8
+  rest_request_delay_seconds: 0.02
+  bars_1m: 32
+  bars_1h: 3
+  klines_limit_cap: 1500
+
+redis:
+  url: redis://127.0.0.1:6379/5
+  key_prefix: "nw:"
+  stream_1h_closed: stream:kline:1h:closed
+  stream_downstream_ack: stream:kline:1h:ack
+  stream_latency_events: stream:latency:events
+  stream_maxlen: 200000
+  published_1h_ttl_seconds: 32400
+  one_m_ring_max_bars: 480
+  one_m_ring_ttl_seconds: 129600
+  pending_latency_max: 100000
+
+alerts:
+  threshold_1m_pct: 10.0
+  threshold_5m_pct: 15.0
+  threshold_1h_pct: 25.0
+  threshold_4h_pct: 40.0
+  cooldown_seconds: 900
+
+webhook:
+  enabled: false
+  url: ""
+
+latency:
+  e2e_warn_ms: 1500
+
+metrics:
+  enabled: true
+  host: 0.0.0.0
+  port: 9090
+
+websocket:
+  host: 0.0.0.0
+  alerts_port: 8765
+  klines_port: 8766
+  # 当前联调阶段使用 5m；生产切换为 1h
+  klines_interval: 5m
+  klines_replay_count: 3
+  # 非阻塞模式：收盘后按 WS 到达尽快推送，不等待“全量达标”
+  klines_full_batch_only: false
+  # 收盘后最短等待窗口（给慢一点的symbol留一点时间），超时即推
+  klines_flush_grace_ms: 5000
+  # 达标推送比例（0~1），例如 0.9 表示达到 90% 可提前触发推送
+  klines_min_publish_ratio: 0.9
+  # REST 仅用于修复缺失：5m联调延迟2分钟后再补
+  klines_rest_repair_delay_ms: 120000
+  # 打印每个批次的完整缺失symbol列表（默认开启，便于对账）
+  klines_log_full_missing_symbols: true
+  # WS 长时间静默时是否启用 REST 兜底修复（实盘追求低延迟可改为 false）
+  klines_ws_silence_fallback_rest: false

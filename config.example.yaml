@@ -1,0 +1,74 @@
+app_name: nextalpha-market-watcher
+service_region: ap-northeast-1
+log_level: INFO
+# alerts | klines | all — 也可用 CLI: nextalpha-watcher run --config ... --mode alerts
+service_mode: all
+
+binance:
+  ws_base: wss://fstream.binance.com/stream
+  rest_base: https://fapi.binance.com
+  symbols_refresh_seconds: 1800
+  # WS 活性 watchdog：连续无实时数据达到阈值时，触发全部分片重建
+  ws_watchdog_enabled: true
+  ws_watchdog_no_data_periods: 2
+  ws_watchdog_check_seconds: 15
+  use_test_symbols: true
+  test_symbols:
+    - BTCUSDT
+    - ETHUSDT
+
+backfill:
+  enabled: true
+  rest_timeout_seconds: 15.0
+  rest_concurrency: 8
+  rest_request_delay_seconds: 0.02
+  bars_1m: 32
+  bars_1h: 3
+  klines_limit_cap: 1500
+
+redis:
+  url: redis://127.0.0.1:6379/0
+  key_prefix: "nw:"
+  stream_1h_closed: stream:kline:1h:closed
+  stream_downstream_ack: stream:kline:1h:ack
+  stream_latency_events: stream:latency:events
+  stream_maxlen: 200000
+  published_1h_ttl_seconds: 32400
+  one_m_ring_max_bars: 480
+  one_m_ring_ttl_seconds: 129600
+  pending_latency_max: 100000
+
+alerts:
+  threshold_1m_pct: 10.0
+  threshold_5m_pct: 15.0
+  threshold_1h_pct: 25.0
+  threshold_4h_pct: 40.0
+  cooldown_seconds: 900
+
+webhook:
+  enabled: false
+  url: ""
+
+latency:
+  e2e_warn_ms: 1500
+
+metrics:
+  enabled: true
+  host: 0.0.0.0
+  port: 9090
+
+websocket:
+  host: 0.0.0.0
+  alerts_port: 8765
+  klines_port: 8766
+  # 生产建议为 1h；压测/联调可临时改为 5m
+  klines_interval: 1h
+  klines_replay_count: 3
+  # 超时补刷等待时间（毫秒）；仅在 klines_full_batch_only=false 时生效
+  klines_flush_grace_ms: 20000
+  # true: 仅全量(全部 symbol 到齐)后推送；false: 允许超时补刷不完整批次
+  klines_full_batch_only: false
+  # 仅用于 full_batch_only=true 时的观测告警，不会触发提前推送
+  klines_full_batch_max_wait_ms: 120000
+  # 推送达标比例（0~1）；例如 0.9 表示收到 90% symbol 即可推送
+  klines_min_publish_ratio: 1.0

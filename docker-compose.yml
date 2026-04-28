@@ -1,0 +1,55 @@
+# 告警与 1h 推送拆成两个容器，可单独 build / restart。
+# 共用同一镜像与 config.docker.yaml；通过 --mode 区分职责。
+
+services:
+  market-watcher-alerts:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: nextalpha-market-watcher-alerts
+    restart: unless-stopped
+    command:
+      - nextalpha-watcher
+      - serve
+      - --config
+      - /app/config.yaml
+      - --mode
+      - alerts
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+    ports:
+      - "8765:8765"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.docker.yaml:/app/config.yaml:ro
+
+  market-watcher-klines:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: nextalpha-market-watcher-klines
+    restart: unless-stopped
+    command:
+      - nextalpha-watcher
+      - serve
+      - --config
+      - /app/config.yaml
+      - --mode
+      - klines
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8766"
+    ports:
+      - "8766:8766"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.docker.yaml:/app/config.yaml:ro

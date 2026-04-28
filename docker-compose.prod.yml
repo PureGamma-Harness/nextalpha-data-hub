@@ -1,0 +1,57 @@
+services:
+  market-watcher-alerts:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: nextalpha-market-watcher-alerts
+    restart: unless-stopped
+    command:
+      - nextalpha-watcher
+      - serve
+      - --config
+      - /app/config.yaml
+      - --mode
+      - alerts
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+    ports:
+      - "8765:8765"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.prod.yaml:/app/config.yaml:ro
+
+  market-watcher-klines:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: nextalpha-market-watcher-klines
+    restart: unless-stopped
+    command:
+      - nextalpha-watcher
+      - serve
+      - --config
+      - /app/config.yaml
+      - --mode
+      - klines
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8766"
+    ports:
+      - "8766:8766"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.prod.yaml:/app/config.yaml:ro
+services:
+  # 预留生产覆盖项（例如镜像 tag、端口、资源限制、日志策略）。
+  # 当前版本无需额外覆盖，保留文件用于后续扩展。
+  market-watcher-alerts: {}
+  market-watcher-klines: {}
