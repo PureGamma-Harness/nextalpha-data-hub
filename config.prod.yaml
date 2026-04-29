@@ -62,8 +62,8 @@ websocket:
   klines_ws_batch_size: 200
   klines_replay_count: 3
   klines_full_batch_only: true
-  klines_max_missing_symbols: 10
-  klines_full_batch_max_wait_ms: 1200
+  klines_max_missing_symbols: 50
+  klines_full_batch_max_wait_ms: 120000
   klines_flush_grace_ms: 5000
   klines_min_publish_ratio: 1.0
   klines_rest_repair_delay_ms: 3000
