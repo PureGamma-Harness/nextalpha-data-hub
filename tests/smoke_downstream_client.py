@@ -119,11 +119,14 @@ async def _run() -> None:
         except Exception as exc:
             if stop:
                 break
+            err_msg = str(exc).strip() or repr(exc)
             print(
                 json.dumps(
                     {
                         "event": "downstream.reconnect",
-                        "error": str(exc),
+                        "error": err_msg,
+                        "error_type": type(exc).__name__,
+                        "hint": "If error is empty, check EC2/security group allows inbound TCP 8766 from this machine",
                         "retry_in_seconds": 2,
                     },
                     ensure_ascii=False,

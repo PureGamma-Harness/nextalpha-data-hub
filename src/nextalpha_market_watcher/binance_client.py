@@ -76,6 +76,8 @@ def _kline_from_rest_row(symbol: str, interval: str, row: list) -> ClosedKline:
         event_time_ms=close_t,
         ingest_time_ms=ingest_ms,
         source="rest",
+        ws_shard_id="",
+        ws_shard_symbol_count=0,
     )
 
 
@@ -567,6 +569,8 @@ class BinanceClient:
                                 event_time_ms=int(data["E"]),
                                 ingest_time_ms=ingest_ms,
                                 source="ws",
+                                ws_shard_id=shard_id,
+                                ws_shard_symbol_count=len(symbols),
                             )
                             lag = max(0, kline.ingest_time_ms - kline.event_time_ms)
                             EXCHANGE_TO_SERVICE_MS.labels(interval, kline.source).observe(lag)

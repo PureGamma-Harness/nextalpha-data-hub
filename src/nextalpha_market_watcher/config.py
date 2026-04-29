@@ -77,6 +77,8 @@ class WebSocketPushConfig(BaseModel):
     # If True, publish each closed kline row immediately to downstream clients
     # without server-side close_time batch aggregation.
     klines_passthrough_mode: bool = False
+    # Max wait (ms) to hold a shard-local buffer before flushing a partial batch.
+    klines_passthrough_shard_max_wait_ms: int = 3_000
     klines_replay_count: int = 3
     klines_flush_grace_ms: int = 20_000
     klines_full_batch_only: bool = False

@@ -19,3 +19,6 @@ class ClosedKline:
     event_time_ms: int
     ingest_time_ms: int
     source: str = "ws"
+    # Binance combined-stream shard (passthrough batching); empty for REST/synthetic.
+    ws_shard_id: str = ""
+    ws_shard_symbol_count: int = 0

@@ -18,6 +18,7 @@ from .binance_client import BinanceClient
 from .config import AppConfig
 from .latency import LatencyEvent
 from .metrics import start_metrics_server
+from .models import ClosedKline
 from .notifier import Notifier
 from .ws_push import WsBroadcaster
 
@@ -87,6 +88,11 @@ class App:
         self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
         self._publish_queue: asyncio.Queue[tuple[int, dict[str, dict], int | None]] = asyncio.Queue(maxsize=4096)
         self._latency_write_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=200_000)
+        self._passthrough_shard_lock = asyncio.Lock()
+        self._passthrough_shard_buffers: dict[tuple[int, str], dict[str, dict]] = {}
+        # [expected_symbol_count, first_wall_ms, min_ingest_ms]
+        self._passthrough_shard_meta: dict[tuple[int, str], list[int]] = {}
+        self._passthrough_shard_max_wait_ms = max(50, self._cfg.websocket.klines_passthrough_shard_max_wait_ms)
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop_event = stop if stop is not None else asyncio.Event()
@@ -101,6 +107,7 @@ class App:
         refresh_task: asyncio.Task[None] | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         stale_flush_task: asyncio.Task[None] | None = None
+        passthrough_flush_task: asyncio.Task[None] | None = None
         publish_worker_task: asyncio.Task[None] | None = None
         latency_writer_task: asyncio.Task[None] | None = None
         ws_tasks: list[asyncio.Task[None]] = []
@@ -118,6 +125,8 @@ class App:
             latency_writer_task = asyncio.create_task(self._run_latency_writer(stop_event))
             if self._cfg.service_mode in ("klines", "all") and not self._klines_passthrough_mode:
                 stale_flush_task = asyncio.create_task(self._run_klines_stale_flush(stop_event))
+            if self._cfg.service_mode in ("klines", "all") and self._klines_passthrough_mode:
+                passthrough_flush_task = asyncio.create_task(self._run_passthrough_shard_flush(stop_event))
             stop_wait = asyncio.create_task(stop_event.wait())
 
             while True:
@@ -140,6 +149,8 @@ class App:
                         await asyncio.gather(heartbeat_task, return_exceptions=True)
                     if stale_flush_task:
                         await asyncio.gather(stale_flush_task, return_exceptions=True)
+                    if passthrough_flush_task:
+                        await asyncio.gather(passthrough_flush_task, return_exceptions=True)
                     if publish_worker_task:
                         await asyncio.gather(publish_worker_task, return_exceptions=True)
                     if latency_writer_task:
@@ -177,6 +188,7 @@ class App:
                 refresh_task,
                 heartbeat_task,
                 stale_flush_task,
+                passthrough_flush_task,
                 publish_worker_task,
                 latency_writer_task,
                 *ws_tasks,
@@ -216,6 +228,71 @@ class App:
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _passthrough_row_dict(self, kline: ClosedKline) -> dict:
+        return {
+            "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
+            "symbol": kline.symbol,
+            "interval": kline.interval,
+            "open_time_ms": kline.open_time_ms,
+            "close_time_ms": kline.close_time_ms,
+            "open": str(kline.open_price),
+            "high": str(kline.high_price),
+            "low": str(kline.low_price),
+            "close": str(kline.close_price),
+            "volume": str(kline.volume),
+            "quote_volume": str(kline.quote_volume),
+            "exchange_event_ms": kline.event_time_ms,
+            "service_ingest_ms": kline.ingest_time_ms,
+            "service_region": self._cfg.service_region,
+            "source": kline.source,
+            "ws_shard_id": kline.ws_shard_id,
+            "ws_shard_symbol_count": kline.ws_shard_symbol_count,
+        }
+
+    async def _passthrough_buffer_add(self, kline: ClosedKline) -> None:
+        row = self._passthrough_row_dict(kline)
+        if kline.ws_shard_symbol_count <= 0 or not kline.ws_shard_id:
+            await self._enqueue_publish(kline.close_time_ms, {kline.symbol: row}, kline.ingest_time_ms)
+            return
+        key = (kline.close_time_ms, kline.ws_shard_id)
+        maybe_flush: tuple[int, dict[str, dict], int | None] | None = None
+        async with self._passthrough_shard_lock:
+            buf = self._passthrough_shard_buffers.setdefault(key, {})
+            buf[kline.symbol] = row
+            meta = self._passthrough_shard_meta.setdefault(
+                key,
+                [kline.ws_shard_symbol_count, int(time.time() * 1000), kline.ingest_time_ms],
+            )
+            meta[2] = min(meta[2], kline.ingest_time_ms)
+            if len(buf) >= meta[0]:
+                maybe_flush = (key[0], dict(buf), meta[2])
+                del self._passthrough_shard_buffers[key]
+                del self._passthrough_shard_meta[key]
+        if maybe_flush is not None:
+            close_ms, rows, first_ingest = maybe_flush
+            await self._enqueue_publish(close_ms, rows, first_ingest)
+
+    async def _run_passthrough_shard_flush(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(0.05)
+            now_ms = int(time.time() * 1000)
+            flush_items: list[tuple[int, dict[str, dict], int | None]] = []
+            async with self._passthrough_shard_lock:
+                for key in list(self._passthrough_shard_buffers.keys()):
+                    buf = self._passthrough_shard_buffers.get(key)
+                    if not buf:
+                        continue
+                    meta = self._passthrough_shard_meta.get(key)
+                    if not meta:
+                        continue
+                    _exp, first_wall, min_ingest = meta
+                    if now_ms - first_wall >= self._passthrough_shard_max_wait_ms:
+                        flush_items.append((key[0], dict(buf), min_ingest))
+                        del self._passthrough_shard_buffers[key]
+                        del self._passthrough_shard_meta[key]
+            for close_ms, rows, first_ingest in flush_items:
+                await self._enqueue_publish(close_ms, rows, first_ingest)
+
     async def _run_1h_publish(self, symbols: list[str]) -> None:
         if self._klines_ws is None:
             async for _ in self._binance.iter_closed_klines(symbols, interval=self._klines_interval):
@@ -248,28 +325,7 @@ class App:
             latest_close_by_symbol[kline.symbol] = kline.close_time_ms
             self._ingest_1h += 1
             if self._klines_passthrough_mode:
-                row = {
-                    "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
-                    "symbol": kline.symbol,
-                    "interval": kline.interval,
-                    "open_time_ms": kline.open_time_ms,
-                    "close_time_ms": kline.close_time_ms,
-                    "open": str(kline.open_price),
-                    "high": str(kline.high_price),
-                    "low": str(kline.low_price),
-                    "close": str(kline.close_price),
-                    "volume": str(kline.volume),
-                    "quote_volume": str(kline.quote_volume),
-                    "exchange_event_ms": kline.event_time_ms,
-                    "service_ingest_ms": kline.ingest_time_ms,
-                    "service_region": self._cfg.service_region,
-                    "source": kline.source,
-                }
-                await self._enqueue_publish(
-                    close_time_ms=kline.close_time_ms,
-                    rows_by_symbol={kline.symbol: row},
-                    first_ingest_ms=kline.ingest_time_ms,
-                )
+                await self._passthrough_buffer_add(kline)
                 continue
             complete_rows: dict[str, dict] | None = None
             async with self._pending_lock:
