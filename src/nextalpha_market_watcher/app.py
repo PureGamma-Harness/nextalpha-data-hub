@@ -81,11 +81,18 @@ class App:
         self._event_close_time: dict[str, int] = {}
         self._ack_service_to_downstream_by_close: dict[int, list[int]] = {}
         self._ack_ingest_to_downstream_by_close: dict[int, list[int]] = {}
+        self._batch_done_to_ack_by_close: dict[int, list[int]] = {}
+        self._batch_done_to_integrated_ack_by_close: dict[int, list[int]] = {}
         self._ack_expected_by_close: dict[int, int] = {}
         self._ack_clients_by_close: dict[int, set[int]] = {}
+        self._batch_ack_clients_by_close: dict[int, set[int]] = {}
+        self._batch_integrated_ack_clients_by_close: dict[int, set[int]] = {}
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
         self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
+        self._passthrough_shards_sent_by_close: dict[int, set[str]] = {}
+        self._passthrough_total_shards_by_close: dict[int, int] = {}
+        self._batch_done_publish_ms_by_close: dict[int, int] = {}
         self._publish_queue: asyncio.Queue[tuple[int, dict[str, dict], int | None]] = asyncio.Queue(maxsize=4096)
         self._latency_write_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=200_000)
         self._passthrough_shard_lock = asyncio.Lock()
@@ -247,6 +254,7 @@ class App:
             "source": kline.source,
             "ws_shard_id": kline.ws_shard_id,
             "ws_shard_symbol_count": kline.ws_shard_symbol_count,
+            "ws_total_shards": kline.ws_total_shards,
         }
 
     async def _passthrough_buffer_add(self, kline: ClosedKline) -> None:
@@ -401,9 +409,30 @@ class App:
         if self._klines_recent.maxlen and self._klines_recent.maxlen > 0:
             async with self._klines_recent_lock:
                 self._klines_recent.append(payload)
+        batch_done = False
+        batch_sent_shards = 0
+        batch_total_shards = 0
+        if self._klines_passthrough_mode and payload:
+            shard_id = str(payload[0].get("ws_shard_id") or "")
+            if shard_id:
+                total_from_payload = int(payload[0].get("ws_total_shards") or 0)
+                sent = self._passthrough_shards_sent_by_close.setdefault(close_time_ms, set())
+                sent.add(shard_id)
+                total = self._passthrough_total_shards_by_close.get(close_time_ms, 0)
+                total = max(total, total_from_payload)
+                self._passthrough_total_shards_by_close[close_time_ms] = total
+                batch_sent_shards = len(sent)
+                batch_total_shards = total
+                batch_done = total > 0 and batch_sent_shards >= total
+            for row in payload:
+                row["batch_sent_shards"] = batch_sent_shards
+                row["batch_total_shards"] = batch_total_shards
+                row["batch_done"] = batch_done
         pushed_clients = await self._klines_ws.broadcast_json(payload)
         self._enqueue_latency_events(self._build_published_latency_events(payload))
         push_done_ms = int(time.time() * 1000)
+        if batch_done:
+            self._batch_done_publish_ms_by_close[close_time_ms] = push_done_ms
         service_to_client_no_ack_ms = max(0, push_done_ms - publish_ms)
         if pushed_clients > 0:
             self._push_1h += pushed_clients * len(payload)
@@ -875,19 +904,61 @@ class App:
             return
 
         ack_items: list[dict] = []
+        batch_ack_item: dict | None = None
+        batch_integrated_ack_item: dict | None = None
         if isinstance(payload, dict):
-            if "event_id" in payload:
+            if payload.get("type") == "batch_ack":
+                batch_ack_item = payload
+            elif payload.get("type") == "batch_integrated_ack":
+                batch_integrated_ack_item = payload
+            elif "event_id" in payload:
                 ack_items = [payload]
             elif isinstance(payload.get("acks"), list):
                 ack_items = [x for x in payload["acks"] if isinstance(x, dict)]
         elif isinstance(payload, list):
             ack_items = [x for x in payload if isinstance(x, dict)]
 
+        sender_client_id = id(_ws)
+        if batch_ack_item is not None:
+            await self._apply_batch_ack(batch_ack_item, sender_client_id)
+        if batch_integrated_ack_item is not None:
+            await self._apply_batch_integrated_ack(batch_integrated_ack_item, sender_client_id)
         if not ack_items:
             return
-        sender_client_id = id(_ws)
         for item in ack_items:
             await self._apply_downstream_ack(item, sender_client_id)
+
+    async def _apply_batch_ack(self, item: dict, sender_client_id: int | None = None) -> None:
+        try:
+            close_time_ms = int(item.get("close_time_ms") or 0)
+            downstream_receive_ms = int(item.get("downstream_receive_ms") or 0)
+        except (TypeError, ValueError):
+            return
+        if close_time_ms <= 0 or downstream_receive_ms <= 0:
+            return
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        if done_publish_ms is None or done_publish_ms <= 0:
+            return
+        done_to_ack_ms = max(0, downstream_receive_ms - done_publish_ms)
+        self._batch_done_to_ack_by_close.setdefault(close_time_ms, []).append(done_to_ack_ms)
+        if sender_client_id is not None:
+            self._batch_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+
+    async def _apply_batch_integrated_ack(self, item: dict, sender_client_id: int | None = None) -> None:
+        try:
+            close_time_ms = int(item.get("close_time_ms") or 0)
+            integrated_ack_ms = int(item.get("downstream_integrated_ms") or 0)
+        except (TypeError, ValueError):
+            return
+        if close_time_ms <= 0 or integrated_ack_ms <= 0:
+            return
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        if done_publish_ms is None or done_publish_ms <= 0:
+            return
+        done_to_integrated_ack_ms = max(0, integrated_ack_ms - done_publish_ms)
+        self._batch_done_to_integrated_ack_by_close.setdefault(close_time_ms, []).append(done_to_integrated_ack_ms)
+        if sender_client_id is not None:
+            self._batch_integrated_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
 
     async def _apply_downstream_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         event_id = str(item.get("event_id") or "")
@@ -1051,7 +1122,11 @@ class App:
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
         ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(close_time_ms, [])
+        batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(close_time_ms, [])
+        batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(close_time_ms, [])
         ack_clients = len(self._ack_clients_by_close.get(close_time_ms, set()))
+        batch_ack_clients = len(self._batch_ack_clients_by_close.get(close_time_ms, set()))
+        batch_integrated_ack_clients = len(self._batch_integrated_ack_clients_by_close.get(close_time_ms, set()))
         batch = self._batch_summary_by_close.get(close_time_ms, {})
         raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
         round_sizes = raw_metrics.get("push_round_sizes", [])
@@ -1087,10 +1162,14 @@ class App:
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
             f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
             f"ACK上报客户端数：{ack_clients}\n"
+            f"批次ACK上报客户端数：{batch_ack_clients}\n"
+            f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
             f"ACK已回执：{len(values)}\n"
             f"ACK期望总数：{expected}\n"
             f"服务端整合+客户端ACK反馈耗时：{self._format_stats(ingest_to_downstream_values)}\n"
             f"服务端直推+客户端整合ACK反馈耗时：{self._format_stats(values)}\n"
+            f"分片全部推送后批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
+            f"分片全部推送后整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
             f"{ack_line}"
         )
         try:
@@ -1100,10 +1179,17 @@ class App:
         finally:
             self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
             self._ack_ingest_to_downstream_by_close.pop(close_time_ms, None)
+            self._batch_done_to_ack_by_close.pop(close_time_ms, None)
+            self._batch_done_to_integrated_ack_by_close.pop(close_time_ms, None)
             self._ack_expected_by_close.pop(close_time_ms, None)
             self._ack_clients_by_close.pop(close_time_ms, None)
+            self._batch_ack_clients_by_close.pop(close_time_ms, None)
+            self._batch_integrated_ack_clients_by_close.pop(close_time_ms, None)
             self._batch_summary_by_close.pop(close_time_ms, None)
             self._batch_metric_values_by_close.pop(close_time_ms, None)
+            self._passthrough_shards_sent_by_close.pop(close_time_ms, None)
+            self._passthrough_total_shards_by_close.pop(close_time_ms, None)
+            self._batch_done_publish_ms_by_close.pop(close_time_ms, None)
             self._ack_notify_scheduled.discard(close_time_ms)
 
     def _format_stats(self, values: list[int]) -> str:

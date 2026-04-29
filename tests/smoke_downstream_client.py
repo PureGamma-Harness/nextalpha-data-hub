@@ -44,6 +44,7 @@ async def _run() -> None:
             ensure_ascii=False,
         ),
     )
+    integrated_rows_by_close: dict[int, dict[str, dict]] = {}
     while not stop:
         try:
             async with websockets.connect(args.ws_url, ping_interval=20, ping_timeout=20) as ws:
@@ -77,6 +78,7 @@ async def _run() -> None:
                         ),
                     )
                     ack_items: list[dict] = []
+                    batch_done_close_time_ms: int | None = None
                     for row in rows:
                         exchange_event_ms = int(row.get("exchange_event_ms", 0) or 0)
                         service_publish_ms = int(row.get("service_publish_ms", 0) or 0)
@@ -93,6 +95,18 @@ async def _run() -> None:
                                 ensure_ascii=False,
                             ),
                         )
+                        if bool(row.get("batch_done")) and row.get("close_time_ms") is not None:
+                            try:
+                                batch_done_close_time_ms = int(row.get("close_time_ms"))
+                            except (TypeError, ValueError):
+                                batch_done_close_time_ms = None
+                        try:
+                            close_time_key = int(row.get("close_time_ms") or 0)
+                        except (TypeError, ValueError):
+                            close_time_key = 0
+                        symbol = str(row.get("symbol") or "")
+                        if close_time_key > 0 and symbol:
+                            integrated_rows_by_close.setdefault(close_time_key, {})[symbol] = row
                         event_id = row.get("event_id")
                         if args.ack_enabled and event_id:
                             ack_items.append(
@@ -116,6 +130,33 @@ async def _run() -> None:
                                 ensure_ascii=False,
                             ),
                         )
+                    if args.ack_enabled and batch_done_close_time_ms is not None:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "batch_ack",
+                                    "close_time_ms": batch_done_close_time_ms,
+                                    "downstream_receive_ms": now_ms,
+                                    "downstream_region": args.downstream_region,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                        merged_count = len(integrated_rows_by_close.get(batch_done_close_time_ms, {}))
+                        integrated_ms = int(time.time() * 1000)
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "batch_integrated_ack",
+                                    "close_time_ms": batch_done_close_time_ms,
+                                    "downstream_integrated_ms": integrated_ms,
+                                    "downstream_region": args.downstream_region,
+                                    "merged_symbols": merged_count,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                        integrated_rows_by_close.pop(batch_done_close_time_ms, None)
         except Exception as exc:
             if stop:
                 break
