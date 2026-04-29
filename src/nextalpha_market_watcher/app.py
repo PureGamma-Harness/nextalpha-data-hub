@@ -461,6 +461,8 @@ class App:
             rest_count,
             service_to_client_no_ack_ms,
             pushed_clients,
+            publish_ms,
+            push_done_ms,
         )
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
@@ -953,6 +955,8 @@ class App:
         rest_count: int,
         service_to_client_no_ack_ms: int,
         connected_clients: int,
+        publish_ms: int,
+        push_done_ms: int,
     ) -> None:
         if not payload:
             return
@@ -990,6 +994,8 @@ class App:
                 "s2c_no_ack_values": [],
                 "push_round_sizes": [],
                 "push_round_no_ack_ms": [],
+                "first_publish_ms": 0,
+                "last_push_done_ms": 0,
             },
         )
         metric_values["batch_size"] = int(metric_values["batch_size"]) + len(payload)
@@ -1003,6 +1009,8 @@ class App:
         cast_s2c = metric_values["s2c_no_ack_values"]
         cast_round_sizes = metric_values["push_round_sizes"]
         cast_round_no_ack = metric_values["push_round_no_ack_ms"]
+        first_publish_ms = int(metric_values["first_publish_ms"])
+        last_push_done_ms = int(metric_values["last_push_done_ms"])
         if isinstance(cast_b2s, list):
             cast_b2s.extend(b2s_values)
         if isinstance(cast_s2p, list):
@@ -1013,6 +1021,16 @@ class App:
             cast_round_sizes.append(len(payload))
         if isinstance(cast_round_no_ack, list):
             cast_round_no_ack.append(service_to_client_no_ack_ms)
+        if first_publish_ms <= 0:
+            metric_values["first_publish_ms"] = publish_ms
+        else:
+            metric_values["first_publish_ms"] = min(first_publish_ms, publish_ms)
+        metric_values["last_push_done_ms"] = max(last_push_done_ms, push_done_ms)
+
+        shard_push_done_ms = max(
+            0,
+            int(metric_values["last_push_done_ms"]) - int(metric_values["first_publish_ms"]),
+        )
 
         self._batch_summary_by_close[close_time_key] = {
             "close_time_ms": close_time_key,
@@ -1025,6 +1043,7 @@ class App:
             "service_ingest_to_publish": self._format_stats(cast_s2p if isinstance(cast_s2p, list) else []),
             "service_to_client_no_ack": self._format_stats(cast_s2c if isinstance(cast_s2c, list) else []),
             "connected_clients": int(metric_values["connected_clients"]),
+            "service_ws_shards_push_done_ms": shard_push_done_ms,
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
@@ -1064,6 +1083,7 @@ class App:
             f"服务端直推耗时（前3次）：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
+            f"服务端WSS分片全部推送完成耗时：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
             f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
             f"ACK上报客户端数：{ack_clients}\n"
