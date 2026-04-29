@@ -74,6 +74,9 @@ class WebSocketPushConfig(BaseModel):
     klines_port: int = 8766
     klines_interval: str = "5m"
     klines_ws_batch_size: int = 200
+    # If True, publish each closed kline row immediately to downstream clients
+    # without server-side close_time batch aggregation.
+    klines_passthrough_mode: bool = False
     klines_replay_count: int = 3
     klines_flush_grace_ms: int = 20_000
     klines_full_batch_only: bool = False

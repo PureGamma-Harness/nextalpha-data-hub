@@ -70,6 +70,7 @@ class App:
         self._pending_lock = asyncio.Lock()
         self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
         self._klines_ws_batch_size = max(1, self._cfg.websocket.klines_ws_batch_size)
+        self._klines_passthrough_mode = bool(self._cfg.websocket.klines_passthrough_mode)
         self._rest_repair_delay_ms = self._resolve_rest_repair_delay_ms(self._klines_interval)
         self._rest_repairing_close_times: set[int] = set()
         self._log_full_missing_symbols = self._cfg.websocket.klines_log_full_missing_symbols
@@ -78,10 +79,12 @@ class App:
         self._latency_redis = redis.from_url(cfg.redis.url, decode_responses=True)
         self._event_close_time: dict[str, int] = {}
         self._ack_service_to_downstream_by_close: dict[int, list[int]] = {}
+        self._ack_ingest_to_downstream_by_close: dict[int, list[int]] = {}
         self._ack_expected_by_close: dict[int, int] = {}
         self._ack_clients_by_close: dict[int, set[int]] = {}
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
+        self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
         self._publish_queue: asyncio.Queue[tuple[int, dict[str, dict], int | None]] = asyncio.Queue(maxsize=4096)
         self._latency_write_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=200_000)
 
@@ -113,7 +116,7 @@ class App:
             heartbeat_task = asyncio.create_task(self._run_heartbeat(stop_event))
             publish_worker_task = asyncio.create_task(self._run_publish_worker(stop_event))
             latency_writer_task = asyncio.create_task(self._run_latency_writer(stop_event))
-            if self._cfg.service_mode in ("klines", "all"):
+            if self._cfg.service_mode in ("klines", "all") and not self._klines_passthrough_mode:
                 stale_flush_task = asyncio.create_task(self._run_klines_stale_flush(stop_event))
             stop_wait = asyncio.create_task(stop_event.wait())
 
@@ -244,6 +247,30 @@ class App:
                 continue
             latest_close_by_symbol[kline.symbol] = kline.close_time_ms
             self._ingest_1h += 1
+            if self._klines_passthrough_mode:
+                row = {
+                    "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
+                    "symbol": kline.symbol,
+                    "interval": kline.interval,
+                    "open_time_ms": kline.open_time_ms,
+                    "close_time_ms": kline.close_time_ms,
+                    "open": str(kline.open_price),
+                    "high": str(kline.high_price),
+                    "low": str(kline.low_price),
+                    "close": str(kline.close_price),
+                    "volume": str(kline.volume),
+                    "quote_volume": str(kline.quote_volume),
+                    "exchange_event_ms": kline.event_time_ms,
+                    "service_ingest_ms": kline.ingest_time_ms,
+                    "service_region": self._cfg.service_region,
+                    "source": kline.source,
+                }
+                await self._enqueue_publish(
+                    close_time_ms=kline.close_time_ms,
+                    rows_by_symbol={kline.symbol: row},
+                    first_ingest_ms=kline.ingest_time_ms,
+                )
+                continue
             complete_rows: dict[str, dict] | None = None
             async with self._pending_lock:
                 if kline.close_time_ms in self._published_close_times:
@@ -325,16 +352,26 @@ class App:
         if pushed_clients > 0:
             self._push_1h += pushed_clients * len(payload)
         got_symbols = len(rows_by_symbol)
-        expected_symbols = len(self._expected_symbols)
-        missing_symbols = expected_symbols - got_symbols
-        got_ratio = (got_symbols / expected_symbols) if expected_symbols > 0 else 0.0
-        missing_list = sorted(self._expected_symbols - set(rows_by_symbol.keys()))
+        if self._klines_passthrough_mode:
+            expected_symbols = self._ack_expected_by_close.get(close_time_ms, got_symbols)
+            missing_symbols = 0
+            got_ratio = 1.0
+            missing_list: list[str] = []
+        else:
+            expected_symbols = len(self._expected_symbols)
+            missing_symbols = expected_symbols - got_symbols
+            got_ratio = (got_symbols / expected_symbols) if expected_symbols > 0 else 0.0
+            missing_list = sorted(self._expected_symbols - set(rows_by_symbol.keys()))
         missing_sample = ",".join(missing_list[:20]) if missing_list else "-"
         ws_count = sum(1 for row in payload if row.get("source") == "ws")
         rest_count = len(payload) - ws_count
         full_batch_wait_ms = None
         if first_ingest_ms is not None:
             full_batch_wait_ms = max(0, publish_ms - first_ingest_ms)
+        min_required_for_log = 1 if self._klines_passthrough_mode else max(
+            1,
+            math.ceil(expected_symbols * self._min_publish_ratio),
+        )
         logger.info(
             "klines.batch.published close_time_ms=%s batch_size=%s got_symbols=%s expected_symbols=%s got_ratio=%.3f ws_count=%s rest_count=%s min_required=%s missing_symbols=%s missing_sample=%s full_batch_wait_ms=%s full_batch_only=%s min_publish_ratio=%.3f pushed_clients=%s pushed_rows_total=%s",
             close_time_ms,
@@ -344,7 +381,7 @@ class App:
             got_ratio,
             ws_count,
             rest_count,
-            max(1, math.ceil(expected_symbols * self._min_publish_ratio)),
+            min_required_for_log,
             max(0, missing_symbols),
             missing_sample,
             full_batch_wait_ms,
@@ -702,7 +739,7 @@ class App:
             except (TypeError, ValueError):
                 close_time_ms = 0
             if close_time_ms > 0:
-                self._ack_expected_by_close[close_time_ms] = len(payload)
+                self._ack_expected_by_close[close_time_ms] = self._ack_expected_by_close.get(close_time_ms, 0) + len(payload)
                 self._ack_service_to_downstream_by_close.setdefault(close_time_ms, [])
                 if close_time_ms not in self._ack_notify_scheduled:
                     self._ack_notify_scheduled.add(close_time_ms)
@@ -830,6 +867,8 @@ class App:
         )
         if close_time_ms is not None and svc_to_downstream is not None:
             self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
+            ingest_to_downstream = max(0, downstream_receive_ms - ev.service_ingest_ms)
+            self._ack_ingest_to_downstream_by_close.setdefault(close_time_ms, []).append(int(ingest_to_downstream))
             if sender_client_id is not None:
                 self._ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
         self._enqueue_latency_events(
@@ -881,25 +920,83 @@ class App:
             close_time_key = 0
         if close_time_key <= 0:
             return
+        metric_values = self._batch_metric_values_by_close.setdefault(
+            close_time_key,
+            {
+                "batch_size": 0,
+                "expected_symbols": 0,
+                "missing_symbols": 0,
+                "ws_count": 0,
+                "rest_count": 0,
+                "connected_clients": 0,
+                "b2s_values": [],
+                "s2p_values": [],
+                "s2c_no_ack_values": [],
+                "push_round_sizes": [],
+                "push_round_no_ack_ms": [],
+            },
+        )
+        metric_values["batch_size"] = int(metric_values["batch_size"]) + len(payload)
+        metric_values["expected_symbols"] = max(int(metric_values["expected_symbols"]), int(expected_symbols))
+        metric_values["missing_symbols"] = max(int(metric_values["missing_symbols"]), max(0, missing_symbols))
+        metric_values["ws_count"] = int(metric_values["ws_count"]) + ws_count
+        metric_values["rest_count"] = int(metric_values["rest_count"]) + rest_count
+        metric_values["connected_clients"] = max(int(metric_values["connected_clients"]), max(0, connected_clients))
+        cast_b2s = metric_values["b2s_values"]
+        cast_s2p = metric_values["s2p_values"]
+        cast_s2c = metric_values["s2c_no_ack_values"]
+        cast_round_sizes = metric_values["push_round_sizes"]
+        cast_round_no_ack = metric_values["push_round_no_ack_ms"]
+        if isinstance(cast_b2s, list):
+            cast_b2s.extend(b2s_values)
+        if isinstance(cast_s2p, list):
+            cast_s2p.extend(s2p_values)
+        if isinstance(cast_s2c, list):
+            cast_s2c.extend([service_to_client_no_ack_ms] * len(payload))
+        if isinstance(cast_round_sizes, list):
+            cast_round_sizes.append(len(payload))
+        if isinstance(cast_round_no_ack, list):
+            cast_round_no_ack.append(service_to_client_no_ack_ms)
+
         self._batch_summary_by_close[close_time_key] = {
             "close_time_ms": close_time_key,
-            "batch_size": len(payload),
-            "expected_symbols": expected_symbols,
-            "missing_symbols": max(0, missing_symbols),
-            "ws_count": ws_count,
-            "rest_count": rest_count,
-            "binance_to_service": self._format_stats(b2s_values),
-            "service_ingest_to_publish": self._format_stats(s2p_values),
-            "service_to_client_no_ack": self._format_stats([service_to_client_no_ack_ms] * len(payload)),
-            "connected_clients": max(0, connected_clients),
+            "batch_size": int(metric_values["batch_size"]),
+            "expected_symbols": int(metric_values["expected_symbols"]),
+            "missing_symbols": int(metric_values["missing_symbols"]),
+            "ws_count": int(metric_values["ws_count"]),
+            "rest_count": int(metric_values["rest_count"]),
+            "binance_to_service": self._format_stats(cast_b2s if isinstance(cast_b2s, list) else []),
+            "service_ingest_to_publish": self._format_stats(cast_s2p if isinstance(cast_s2p, list) else []),
+            "service_to_client_no_ack": self._format_stats(cast_s2c if isinstance(cast_s2c, list) else []),
+            "connected_clients": int(metric_values["connected_clients"]),
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
         await asyncio.sleep(max(1, delay_seconds))
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
+        ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(close_time_ms, [])
         ack_clients = len(self._ack_clients_by_close.get(close_time_ms, set()))
         batch = self._batch_summary_by_close.get(close_time_ms, {})
+        raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
+        round_sizes = raw_metrics.get("push_round_sizes", [])
+        round_no_ack = raw_metrics.get("push_round_no_ack_ms", [])
+        round_lines: list[str] = []
+        if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
+            total_rounds = min(len(round_sizes), len(round_no_ack))
+            for idx in range(min(3, total_rounds)):
+                try:
+                    round_sz = int(round_sizes[idx])
+                    round_ms = int(round_no_ack[idx])
+                except (TypeError, ValueError):
+                    continue
+                round_lines.append(f"第{idx + 1}次：symbols={round_sz} 直推耗时={round_ms}ms")
+        direct_push_stage_text = "；".join(round_lines) if round_lines else "n=0"
+        ack_line = (
+            f"服务端到客户端(ACK)：{self._format_stats(values)}"
+            if values
+            else "服务端到客户端(ACK)：n=0"
+        )
         body = (
             "【K线批次与ACK汇总】\n"
             f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
@@ -908,6 +1005,7 @@ class App:
             f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
             f"WS条数：{batch.get('ws_count', 0)}\n"
             f"REST条数：{batch.get('rest_count', 0)}\n"
+            f"服务端直推耗时（前3次）：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
@@ -915,7 +1013,9 @@ class App:
             f"ACK上报客户端数：{ack_clients}\n"
             f"ACK已回执：{len(values)}\n"
             f"ACK期望总数：{expected}\n"
-            f"服务端到客户端(ACK)：{self._format_stats(values)}"
+            f"服务端整合+客户端ACK反馈耗时：{self._format_stats(ingest_to_downstream_values)}\n"
+            f"服务端直推+客户端整合ACK反馈耗时：{self._format_stats(values)}\n"
+            f"{ack_line}"
         )
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
@@ -923,9 +1023,11 @@ class App:
             logger.exception("notify.ack_summary_failed close_time_ms=%s", close_time_ms)
         finally:
             self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
+            self._ack_ingest_to_downstream_by_close.pop(close_time_ms, None)
             self._ack_expected_by_close.pop(close_time_ms, None)
             self._ack_clients_by_close.pop(close_time_ms, None)
             self._batch_summary_by_close.pop(close_time_ms, None)
+            self._batch_metric_values_by_close.pop(close_time_ms, None)
             self._ack_notify_scheduled.discard(close_time_ms)
 
     def _format_stats(self, values: list[int]) -> str:

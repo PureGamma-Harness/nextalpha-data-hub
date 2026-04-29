@@ -60,6 +60,8 @@ websocket:
   klines_interval: 5m
   # 分片模式：每条WS连接承载约200个symbol
   klines_ws_batch_size: 200
+  # 收到即推送（客户端侧整合）
+  klines_passthrough_mode: true
   klines_replay_count: 3
   klines_full_batch_only: true
   klines_max_missing_symbols: 50
