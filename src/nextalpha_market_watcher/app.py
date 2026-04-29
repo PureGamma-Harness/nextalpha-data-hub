@@ -82,6 +82,8 @@ class App:
         self._ack_clients_by_close: dict[int, set[int]] = {}
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
+        self._publish_queue: asyncio.Queue[tuple[int, dict[str, dict], int | None]] = asyncio.Queue(maxsize=4096)
+        self._latency_write_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=200_000)
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop_event = stop if stop is not None else asyncio.Event()
@@ -96,6 +98,8 @@ class App:
         refresh_task: asyncio.Task[None] | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         stale_flush_task: asyncio.Task[None] | None = None
+        publish_worker_task: asyncio.Task[None] | None = None
+        latency_writer_task: asyncio.Task[None] | None = None
         ws_tasks: list[asyncio.Task[None]] = []
         if self._alerts_ws is not None:
             ws_tasks.append(asyncio.create_task(self._alerts_ws.serve_until_stop(stop_event)))
@@ -107,6 +111,8 @@ class App:
                 asyncio.sleep(self._cfg.binance.symbols_refresh_seconds),
             )
             heartbeat_task = asyncio.create_task(self._run_heartbeat(stop_event))
+            publish_worker_task = asyncio.create_task(self._run_publish_worker(stop_event))
+            latency_writer_task = asyncio.create_task(self._run_latency_writer(stop_event))
             if self._cfg.service_mode in ("klines", "all"):
                 stale_flush_task = asyncio.create_task(self._run_klines_stale_flush(stop_event))
             stop_wait = asyncio.create_task(stop_event.wait())
@@ -131,6 +137,10 @@ class App:
                         await asyncio.gather(heartbeat_task, return_exceptions=True)
                     if stale_flush_task:
                         await asyncio.gather(stale_flush_task, return_exceptions=True)
+                    if publish_worker_task:
+                        await asyncio.gather(publish_worker_task, return_exceptions=True)
+                    if latency_writer_task:
+                        await asyncio.gather(latency_writer_task, return_exceptions=True)
                     break
 
                 if ingest_task in done:
@@ -159,7 +169,15 @@ class App:
 
         finally:
             stop_event.set()
-            to_cancel = [ingest_task, refresh_task, heartbeat_task, stale_flush_task, *ws_tasks]
+            to_cancel = [
+                ingest_task,
+                refresh_task,
+                heartbeat_task,
+                stale_flush_task,
+                publish_worker_task,
+                latency_writer_task,
+                *ws_tasks,
+            ]
             for t in to_cancel:
                 if t is not None and not t.done():
                     t.cancel()
@@ -258,7 +276,7 @@ class App:
                     self._mark_close_time_published_locked(kline.close_time_ms)
 
             if complete_rows:
-                await self._flush_close_time(kline.close_time_ms, complete_rows, first_ingest_ms)
+                await self._enqueue_publish(close_time_ms=kline.close_time_ms, rows_by_symbol=complete_rows, first_ingest_ms=first_ingest_ms)
 
         async with self._pending_lock:
             pending_items = sorted(self._pending_by_close.items())
@@ -279,7 +297,11 @@ class App:
                     len(self._expected_symbols),
                     missing,
                 )
-            await self._flush_close_time(close_time_ms, rows_by_symbol, pending_first.get(close_time_ms))
+            await self._enqueue_publish(
+                close_time_ms=close_time_ms,
+                rows_by_symbol=rows_by_symbol,
+                first_ingest_ms=pending_first.get(close_time_ms),
+            )
 
     async def _flush_close_time(
         self,
@@ -292,11 +314,12 @@ class App:
         publish_ms = int(time.time() * 1000)
         payload = [dict(row, service_publish_ms=publish_ms) for row in rows_by_symbol.values()]
         payload.sort(key=lambda row: row["symbol"])
-        await self._record_published_latency(payload)
+        await self._record_published_latency_state(payload)
         if self._klines_recent.maxlen and self._klines_recent.maxlen > 0:
             async with self._klines_recent_lock:
                 self._klines_recent.append(payload)
         pushed_clients = await self._klines_ws.broadcast_json(payload)
+        self._enqueue_latency_events(self._build_published_latency_events(payload))
         push_done_ms = int(time.time() * 1000)
         service_to_client_no_ack_ms = max(0, push_done_ms - publish_ms)
         if pushed_clients > 0:
@@ -377,7 +400,7 @@ class App:
                     missing,
                     self._flush_grace_ms,
                 )
-            await self._flush_close_time(close_time_ms, rows_by_symbol, first_ingest_ms)
+            await self._enqueue_publish(close_time_ms=close_time_ms, rows_by_symbol=rows_by_symbol, first_ingest_ms=first_ingest_ms)
 
     async def _run_klines_stale_flush(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -429,7 +452,7 @@ class App:
                 self._max_missing_symbols,
                 self._full_batch_max_wait_ms,
             )
-            await self._flush_close_time(close_time_ms, rows_by_symbol, first_ingest_ms)
+            await self._enqueue_publish(close_time_ms=close_time_ms, rows_by_symbol=rows_by_symbol, first_ingest_ms=first_ingest_ms)
 
     async def _try_rest_repair_for_waiting_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
@@ -541,7 +564,7 @@ class App:
             min_required,
         )
         if maybe_flush_rows:
-            await self._flush_close_time(close_time_ms, maybe_flush_rows, first_ingest_ms)
+            await self._enqueue_publish(close_time_ms=close_time_ms, rows_by_symbol=maybe_flush_rows, first_ingest_ms=first_ingest_ms)
 
     async def _log_full_batch_waiting(self, now_ms: int) -> None:
         if not self._full_batch_only:
@@ -622,10 +645,29 @@ class App:
                 break
         logger.info("ws.client.replay name=klines replayed=%s", sent)
 
-    async def _record_published_latency(self, payload: list[dict]) -> None:
+    async def _enqueue_publish(self, close_time_ms: int, rows_by_symbol: dict[str, dict], first_ingest_ms: int | None) -> None:
+        if not rows_by_symbol:
+            return
+        await self._publish_queue.put((close_time_ms, rows_by_symbol, first_ingest_ms))
+
+    async def _run_publish_worker(self, stop: asyncio.Event) -> None:
+        while True:
+            if stop.is_set() and self._publish_queue.empty():
+                break
+            try:
+                close_time_ms, rows_by_symbol, first_ingest_ms = await asyncio.wait_for(self._publish_queue.get(), timeout=0.5)
+            except TimeoutError:
+                continue
+            try:
+                await self._flush_close_time(close_time_ms, rows_by_symbol, first_ingest_ms)
+            except Exception:
+                logger.exception("klines.publish_worker.failed close_time_ms=%s", close_time_ms)
+            finally:
+                self._publish_queue.task_done()
+
+    async def _record_published_latency_state(self, payload: list[dict]) -> None:
         if not payload:
             return
-        stream = self._cfg.redis.stream_latency_events
         cap = self._cfg.redis.pending_latency_max
         for row in payload:
             event_id = str(row.get("event_id") or "")
@@ -654,22 +696,6 @@ class App:
                 self._pending_latency[event_id] = ev
                 if close_time_ms > 0:
                     self._event_close_time[event_id] = close_time_ms
-            try:
-                await self._latency_redis.xadd(
-                    stream,
-                    fields={
-                        "event_id": ev.event_id,
-                        "symbol": ev.symbol,
-                        "interval": ev.interval,
-                        "exchange_to_service_ms": str(ev.exchange_to_service_ms()),
-                        "service_region": ev.service_region,
-                        "phase": "published",
-                    },
-                    maxlen=self._cfg.redis.stream_maxlen,
-                    approximate=True,
-                )
-            except Exception:
-                logger.exception("latency.published.persist_failed event_id=%s", event_id)
         if payload:
             try:
                 close_time_ms = int(payload[0].get("close_time_ms") or 0)
@@ -681,6 +707,71 @@ class App:
                 if close_time_ms not in self._ack_notify_scheduled:
                     self._ack_notify_scheduled.add(close_time_ms)
                     asyncio.create_task(self._notify_ack_summary_later(close_time_ms, delay_seconds=20))
+
+    def _build_published_latency_events(self, payload: list[dict]) -> list[dict[str, str]]:
+        events: list[dict[str, str]] = []
+        for row in payload:
+            event_id = str(row.get("event_id") or "")
+            if not event_id:
+                continue
+            interval = str(row.get("interval") or "")
+            symbol = str(row.get("symbol") or "")
+            try:
+                exchange_event_ms = int(row.get("exchange_event_ms") or 0)
+                service_ingest_ms = int(row.get("service_ingest_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            exchange_to_service_ms = max(0, service_ingest_ms - exchange_event_ms)
+            events.append(
+                {
+                    "event_id": event_id,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "exchange_to_service_ms": str(exchange_to_service_ms),
+                    "service_region": self._cfg.service_region,
+                    "phase": "published",
+                },
+            )
+        return events
+
+    def _enqueue_latency_events(self, events: list[dict[str, str]]) -> None:
+        if not events:
+            return
+        dropped = 0
+        for event in events:
+            try:
+                self._latency_write_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                dropped += 1
+        if dropped > 0:
+            logger.warning("latency.queue.full dropped=%s", dropped)
+
+    async def _run_latency_writer(self, stop: asyncio.Event) -> None:
+        stream = self._cfg.redis.stream_latency_events
+        maxlen = self._cfg.redis.stream_maxlen
+        while True:
+            if stop.is_set() and self._latency_write_queue.empty():
+                break
+            try:
+                first = await asyncio.wait_for(self._latency_write_queue.get(), timeout=0.5)
+            except TimeoutError:
+                continue
+            batch = [first]
+            while len(batch) < 512:
+                try:
+                    batch.append(self._latency_write_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                pipe = self._latency_redis.pipeline(transaction=False)
+                for fields in batch:
+                    pipe.xadd(stream, fields=fields, maxlen=maxlen, approximate=True)
+                await pipe.execute()
+            except Exception:
+                logger.exception("latency.writer.persist_failed batch=%s", len(batch))
+            finally:
+                for _ in batch:
+                    self._latency_write_queue.task_done()
 
     async def _on_klines_client_message(self, _ws: WebSocket, message: str) -> None:
         try:
@@ -741,10 +832,9 @@ class App:
             self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
             if sender_client_id is not None:
                 self._ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
-        try:
-            await self._latency_redis.xadd(
-                self._cfg.redis.stream_latency_events,
-                fields={
+        self._enqueue_latency_events(
+            [
+                {
                     "event_id": ev.event_id,
                     "symbol": ev.symbol,
                     "interval": ev.interval,
@@ -756,11 +846,8 @@ class App:
                     "region_aligned": str(region_ok),
                     "phase": "ack",
                 },
-                maxlen=self._cfg.redis.stream_maxlen,
-                approximate=True,
-            )
-        except Exception:
-            logger.exception("latency.ack.persist_failed event_id=%s", event_id)
+            ],
+        )
 
     async def _notify_kline_batch(
         self,
