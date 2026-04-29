@@ -365,7 +365,7 @@ class BinanceClient:
         shard_ids = [f"{interval}#{idx}" for idx in range(len(symbol_batches))]
         queue: asyncio.Queue[ClosedKline] = asyncio.Queue(maxsize=10000)
         tasks = [
-            asyncio.create_task(self._consume_batch(batch, interval, shard_ids[idx], queue))
+            asyncio.create_task(self._consume_batch(batch, interval, shard_ids[idx], queue, len(shard_ids)))
             for idx, batch in enumerate(symbol_batches)
             if batch and idx < len(shard_ids)
         ]
@@ -451,6 +451,7 @@ class BinanceClient:
         interval: str,
         shard_id: str,
         out_queue: asyncio.Queue[ClosedKline],
+        total_shards: int,
     ) -> None:
         stream_names = [f"{s.lower()}@kline_{interval}" for s in symbols]
         ws_base = self._cfg.binance.ws_base.split("?", 1)[0].rstrip("/")
@@ -572,7 +573,7 @@ class BinanceClient:
                                 source="ws",
                                 ws_shard_id=shard_id,
                                 ws_shard_symbol_count=len(symbols),
-                                ws_total_shards=len(shard_ids),
+                                ws_total_shards=total_shards,
                             )
                             lag = max(0, kline.ingest_time_ms - kline.event_time_ms)
                             EXCHANGE_TO_SERVICE_MS.labels(interval, kline.source).observe(lag)
