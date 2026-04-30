@@ -15,7 +15,7 @@ from websockets.server import WebSocketServerProtocol
 
 from .alerts import AlertEngine, AlertSignal
 from .binance_client import BinanceClient
-from .config import AppConfig
+from .config import AppConfig, WebhookConfig
 from .latency import LatencyEvent
 from .metrics import start_metrics_server
 from .models import ClosedKline
@@ -34,9 +34,17 @@ class App:
     ) -> None:
         self._cfg = cfg
         self._notifier = Notifier(cfg.webhook)
+        alerts_webhook_url = cfg.webhook.alerts_url.strip() or cfg.webhook.url
+        self._alerts_notifier = Notifier(
+            WebhookConfig(
+                enabled=cfg.webhook.enabled,
+                url=alerts_webhook_url,
+                alerts_url=cfg.webhook.alerts_url,
+            ),
+        )
         self._alerts: AlertEngine | None = None
         if cfg.service_mode in ("alerts", "all"):
-            self._alerts = AlertEngine(cfg, self._notifier, self._get_alert_clients_count)
+            self._alerts = AlertEngine(cfg, self._alerts_notifier, self._get_alert_clients_count)
         self._binance = BinanceClient(cfg)
         self._alerts_ws: object | None = alerts_ws
         self._klines_ws: object | None = klines_ws

@@ -35,7 +35,7 @@ redis:
   pending_latency_max: 100000
 
 alerts:
-  threshold_1m_pct: 2.0
+  threshold_1m_pct: 10.0
   threshold_5m_pct: 15.0
   threshold_1h_pct: 25.0
   threshold_4h_pct: 40.0
@@ -44,6 +44,7 @@ alerts:
 webhook:
   enabled: true
   url: "https://open.larksuite.com/open-apis/bot/v2/hook/7187f951-2496-4c16-a026-4cb67bf9ef77"
+  alerts_url: "https://open.larksuite.com/open-apis/bot/v2/hook/ade1cabd-dcd8-49c0-a98e-cbcc5a1e11b0"
 
 latency:
   e2e_warn_ms: 1500

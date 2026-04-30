@@ -56,6 +56,9 @@ class AlertsConfig(BaseModel):
 class WebhookConfig(BaseModel):
     enabled: bool = False
     url: str = ""
+    # Optional dedicated webhook for threshold alert notifications.
+    # If empty, alerts reuse `url`.
+    alerts_url: str = ""
 
 
 class LatencyConfig(BaseModel):
