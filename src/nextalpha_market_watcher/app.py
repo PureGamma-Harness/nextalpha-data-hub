@@ -1412,7 +1412,7 @@ class App:
             f"REST条数：{batch.get('rest_count', 0)}\n"
             f"服务端直推耗时（全部分片）：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
-            f"Binance到服务端（全量到齐耗时）：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
+            f"批次首事件到末入站耗时：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
             f"Binance到服务端（分片到齐耗时）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
             f"Binance到服务端（全部分片轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
             f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
