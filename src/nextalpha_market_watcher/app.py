@@ -1224,7 +1224,7 @@ class App:
         round_lines: list[str] = []
         if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
             total_rounds = min(len(round_sizes), len(round_no_ack))
-            for idx in range(min(3, total_rounds)):
+            for idx in range(total_rounds):
                 try:
                     round_sz = int(round_sizes[idx])
                     round_ms = int(round_no_ack[idx])
@@ -1245,26 +1245,19 @@ class App:
             f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
             f"WS条数：{batch.get('ws_count', 0)}\n"
             f"REST条数：{batch.get('rest_count', 0)}\n"
-            f"服务端直推耗时（前3次）：{direct_push_stage_text}\n"
+            f"服务端直推耗时（全部分片）：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
-            f"服务端整合耗时：{batch.get('service_ingest_to_publish', 'n=0')}\n"
             f"服务端WSS分片全部推送完成耗时：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
             f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
-            f"ACK上报客户端数：{ack_clients}\n"
             f"批次ACK上报客户端数：{batch_ack_clients}\n"
             f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
             f"批次计算ACK上报客户端数：{batch_compute_ack_clients}\n"
             f"批次下单ACK上报客户端数：{batch_order_ack_clients}\n"
-            f"ACK已回执：{len(values)}\n"
-            f"ACK期望总数：{expected}\n"
-            f"服务端整合+客户端ACK反馈耗时：{self._format_stats(ingest_to_downstream_values)}\n"
-            f"服务端直推+客户端整合ACK反馈耗时：{self._format_stats(values)}\n"
             f"分片全部推送后批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
             f"分片全部推送后整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
             f"分片全部推送后计算ACK耗时：{self._format_stats(batch_done_to_compute_ack_values)}\n"
             f"分片全部推送后下单ACK耗时：{self._format_stats(batch_done_to_order_ack_values)}\n"
-            f"{ack_line}"
         )
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
