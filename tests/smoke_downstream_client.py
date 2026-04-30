@@ -162,6 +162,28 @@ async def _run() -> None:
                         else:
                             integrated_body["downstream_integrated_ms"] = int(time.time() * 1000)
                         await ws.send(json.dumps(integrated_body, ensure_ascii=False))
+                        # Mock downstream "compute finished" ack.
+                        compute_body: dict = {
+                            "type": "batch_compute_ack",
+                            "close_time_ms": batch_done_close_time_ms,
+                            "downstream_region": args.downstream_region,
+                        }
+                        if batch_push_done_ms > 0:
+                            compute_body["batch_push_done_ms"] = batch_push_done_ms
+                        else:
+                            compute_body["downstream_compute_ms"] = int(time.time() * 1000)
+                        await ws.send(json.dumps(compute_body, ensure_ascii=False))
+                        # Mock downstream "order finished" ack.
+                        order_body: dict = {
+                            "type": "batch_order_ack",
+                            "close_time_ms": batch_done_close_time_ms,
+                            "downstream_region": args.downstream_region,
+                        }
+                        if batch_push_done_ms > 0:
+                            order_body["batch_push_done_ms"] = batch_push_done_ms
+                        else:
+                            order_body["downstream_order_ms"] = int(time.time() * 1000)
+                        await ws.send(json.dumps(order_body, ensure_ascii=False))
                         integrated_rows_by_close.pop(batch_done_close_time_ms, None)
         except Exception as exc:
             if stop:

@@ -25,3 +25,27 @@ Region consistency:
 
 - compare `service_region` and `downstream_region`
 - `region_aligned=true` when equal
+
+## WebSocket batch ACK extensions
+
+For kline passthrough mode, downstream clients can send these websocket messages
+back to the watcher after receiving `batch_done=true` rows for a `close_time_ms`:
+
+- `batch_ack`: client received batch
+- `batch_integrated_ack`: client merged shards/integrated rows
+- `batch_compute_ack`: client completed strategy compute logic
+- `batch_order_ack`: client completed live order placement logic
+
+Common fields:
+
+- `type`: one of the types above
+- `close_time_ms`: close time for the batch
+- `downstream_region`: client region tag
+- `batch_push_done_ms`: echo from server payload when available (preferred)
+
+Legacy fallback fields (optional when `batch_push_done_ms` is absent):
+
+- `downstream_receive_ms` for `batch_ack`
+- `downstream_integrated_ms` for `batch_integrated_ack`
+- `downstream_compute_ms` for `batch_compute_ack`
+- `downstream_order_ms` for `batch_order_ack`
