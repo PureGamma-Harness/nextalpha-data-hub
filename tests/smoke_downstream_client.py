@@ -79,6 +79,7 @@ async def _run() -> None:
                     )
                     ack_items: list[dict] = []
                     batch_done_close_time_ms: int | None = None
+                    batch_push_done_ms: int = 0
                     for row in rows:
                         exchange_event_ms = int(row.get("exchange_event_ms", 0) or 0)
                         service_publish_ms = int(row.get("service_publish_ms", 0) or 0)
@@ -100,6 +101,11 @@ async def _run() -> None:
                                 batch_done_close_time_ms = int(row.get("close_time_ms"))
                             except (TypeError, ValueError):
                                 batch_done_close_time_ms = None
+                            else:
+                                try:
+                                    batch_push_done_ms = int(row.get("batch_push_done_ms") or 0)
+                                except (TypeError, ValueError):
+                                    batch_push_done_ms = 0
                         try:
                             close_time_key = int(row.get("close_time_ms") or 0)
                         except (TypeError, ValueError):
@@ -131,31 +137,28 @@ async def _run() -> None:
                             ),
                         )
                     if args.ack_enabled and batch_done_close_time_ms is not None:
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "batch_ack",
-                                    "close_time_ms": batch_done_close_time_ms,
-                                    "downstream_receive_ms": now_ms,
-                                    "downstream_region": args.downstream_region,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        )
+                        batch_ack_body: dict = {
+                            "type": "batch_ack",
+                            "close_time_ms": batch_done_close_time_ms,
+                            "downstream_region": args.downstream_region,
+                        }
+                        if batch_push_done_ms > 0:
+                            batch_ack_body["batch_push_done_ms"] = batch_push_done_ms
+                        else:
+                            batch_ack_body["downstream_receive_ms"] = now_ms
+                        await ws.send(json.dumps(batch_ack_body, ensure_ascii=False))
                         merged_count = len(integrated_rows_by_close.get(batch_done_close_time_ms, {}))
-                        integrated_ms = int(time.time() * 1000)
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "batch_integrated_ack",
-                                    "close_time_ms": batch_done_close_time_ms,
-                                    "downstream_integrated_ms": integrated_ms,
-                                    "downstream_region": args.downstream_region,
-                                    "merged_symbols": merged_count,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        )
+                        integrated_body: dict = {
+                            "type": "batch_integrated_ack",
+                            "close_time_ms": batch_done_close_time_ms,
+                            "downstream_region": args.downstream_region,
+                            "merged_symbols": merged_count,
+                        }
+                        if batch_push_done_ms > 0:
+                            integrated_body["batch_push_done_ms"] = batch_push_done_ms
+                        else:
+                            integrated_body["downstream_integrated_ms"] = int(time.time() * 1000)
+                        await ws.send(json.dumps(integrated_body, ensure_ascii=False))
                         integrated_rows_by_close.pop(batch_done_close_time_ms, None)
         except Exception as exc:
             if stop:

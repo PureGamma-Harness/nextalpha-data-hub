@@ -428,11 +428,14 @@ class App:
                 row["batch_sent_shards"] = batch_sent_shards
                 row["batch_total_shards"] = batch_total_shards
                 row["batch_done"] = batch_done
+        batch_push_done_ms = int(time.time() * 1000)
+        for row in payload:
+            row["batch_push_done_ms"] = batch_push_done_ms
         pushed_clients = await self._klines_ws.broadcast_json(payload)
         self._enqueue_latency_events(self._build_published_latency_events(payload))
         push_done_ms = int(time.time() * 1000)
         if batch_done:
-            self._batch_done_publish_ms_by_close[close_time_ms] = push_done_ms
+            self._batch_done_publish_ms_by_close[close_time_ms] = batch_push_done_ms
         service_to_client_no_ack_ms = max(0, push_done_ms - publish_ms)
         if pushed_clients > 0:
             self._push_1h += pushed_clients * len(payload)
@@ -932,14 +935,21 @@ class App:
         try:
             close_time_ms = int(item.get("close_time_ms") or 0)
             downstream_receive_ms = int(item.get("downstream_receive_ms") or 0)
+            echoed_push_done_ms = int(item.get("batch_push_done_ms") or 0)
         except (TypeError, ValueError):
             return
-        if close_time_ms <= 0 or downstream_receive_ms <= 0:
+        if close_time_ms <= 0:
             return
         done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
-        done_to_ack_ms = max(0, downstream_receive_ms - done_publish_ms)
+        server_ingress_ms = int(time.time() * 1000)
+        if echoed_push_done_ms > 0 and echoed_push_done_ms == done_publish_ms:
+            done_to_ack_ms = max(0, server_ingress_ms - echoed_push_done_ms)
+        elif downstream_receive_ms > 0:
+            done_to_ack_ms = max(0, downstream_receive_ms - done_publish_ms)
+        else:
+            return
         self._batch_done_to_ack_by_close.setdefault(close_time_ms, []).append(done_to_ack_ms)
         if sender_client_id is not None:
             self._batch_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
@@ -948,14 +958,21 @@ class App:
         try:
             close_time_ms = int(item.get("close_time_ms") or 0)
             integrated_ack_ms = int(item.get("downstream_integrated_ms") or 0)
+            echoed_push_done_ms = int(item.get("batch_push_done_ms") or 0)
         except (TypeError, ValueError):
             return
-        if close_time_ms <= 0 or integrated_ack_ms <= 0:
+        if close_time_ms <= 0:
             return
         done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
-        done_to_integrated_ack_ms = max(0, integrated_ack_ms - done_publish_ms)
+        server_ingress_ms = int(time.time() * 1000)
+        if echoed_push_done_ms > 0 and echoed_push_done_ms == done_publish_ms:
+            done_to_integrated_ack_ms = max(0, server_ingress_ms - echoed_push_done_ms)
+        elif integrated_ack_ms > 0:
+            done_to_integrated_ack_ms = max(0, integrated_ack_ms - done_publish_ms)
+        else:
+            return
         self._batch_done_to_integrated_ack_by_close.setdefault(close_time_ms, []).append(done_to_integrated_ack_ms)
         if sender_client_id is not None:
             self._batch_integrated_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
