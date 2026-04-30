@@ -1151,8 +1151,17 @@ class App:
                 "s2c_no_ack_values": [],
                 "push_round_sizes": [],
                 "push_round_no_ack_ms": [],
+                "push_round_b2s_ms": [],
                 "first_publish_ms": 0,
                 "last_push_done_ms": 0,
+                "exchange_event_min_ms": 0,
+                "service_ingest_min_ms": 0,
+                "service_ingest_max_ms": 0,
+                "shard_exchange_event_min_ms": {},
+                "shard_service_ingest_min_ms": {},
+                "shard_service_ingest_max_ms": {},
+                "shard_symbol_counts": {},
+                "delayed_tokens": [],
             },
         )
         metric_values["batch_size"] = int(metric_values["batch_size"]) + len(payload)
@@ -1166,8 +1175,17 @@ class App:
         cast_s2c = metric_values["s2c_no_ack_values"]
         cast_round_sizes = metric_values["push_round_sizes"]
         cast_round_no_ack = metric_values["push_round_no_ack_ms"]
+        cast_round_b2s = metric_values["push_round_b2s_ms"]
+        cast_delayed_tokens = metric_values["delayed_tokens"]
         first_publish_ms = int(metric_values["first_publish_ms"])
         last_push_done_ms = int(metric_values["last_push_done_ms"])
+        exchange_event_min_ms = int(metric_values["exchange_event_min_ms"])
+        service_ingest_min_ms = int(metric_values["service_ingest_min_ms"])
+        service_ingest_max_ms = int(metric_values["service_ingest_max_ms"])
+        shard_exchange_min = metric_values["shard_exchange_event_min_ms"]
+        shard_ingest_min = metric_values["shard_service_ingest_min_ms"]
+        shard_ingest_max = metric_values["shard_service_ingest_max_ms"]
+        shard_symbol_counts = metric_values["shard_symbol_counts"]
         if isinstance(cast_b2s, list):
             cast_b2s.extend(b2s_values)
         if isinstance(cast_s2p, list):
@@ -1178,16 +1196,158 @@ class App:
             cast_round_sizes.append(len(payload))
         if isinstance(cast_round_no_ack, list):
             cast_round_no_ack.append(service_to_client_no_ack_ms)
+        if isinstance(cast_round_b2s, list):
+            round_exchange_min = 0
+            round_ingest_max = 0
+            for row in payload:
+                try:
+                    row_exchange_event_ms = int(row.get("exchange_event_ms") or 0)
+                    row_service_ingest_ms = int(row.get("service_ingest_ms") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if row_exchange_event_ms > 0:
+                    round_exchange_min = (
+                        row_exchange_event_ms
+                        if round_exchange_min <= 0
+                        else min(round_exchange_min, row_exchange_event_ms)
+                    )
+                round_ingest_max = max(round_ingest_max, row_service_ingest_ms)
+            round_b2s_ms = (
+                max(0, round_ingest_max - round_exchange_min)
+                if round_ingest_max > 0 and round_exchange_min > 0
+                else 0
+            )
+            cast_round_b2s.append(round_b2s_ms)
+        if isinstance(cast_delayed_tokens, list):
+            for row in payload:
+                try:
+                    symbol = str(row.get("symbol") or "")
+                    row_close_time_ms = int(row.get("close_time_ms") or 0)
+                    row_service_ingest_ms = int(row.get("service_ingest_ms") or 0)
+                    row_service_publish_ms = int(row.get("service_publish_ms") or 0)
+                    row_exchange_event_ms = int(row.get("exchange_event_ms") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not symbol or row_service_ingest_ms <= 0 or row_service_publish_ms <= 0:
+                    continue
+                wait_ms = max(0, row_service_publish_ms - row_service_ingest_ms)
+                cast_delayed_tokens.append(
+                    {
+                        "symbol": symbol,
+                        "wait_ms": wait_ms,
+                        "close_time_ms": row_close_time_ms,
+                    },
+                )
+                if row_exchange_event_ms > 0:
+                    if exchange_event_min_ms <= 0:
+                        exchange_event_min_ms = row_exchange_event_ms
+                    else:
+                        exchange_event_min_ms = min(exchange_event_min_ms, row_exchange_event_ms)
+                if service_ingest_min_ms <= 0:
+                    service_ingest_min_ms = row_service_ingest_ms
+                else:
+                    service_ingest_min_ms = min(service_ingest_min_ms, row_service_ingest_ms)
+                service_ingest_max_ms = max(service_ingest_max_ms, row_service_ingest_ms)
+                shard_id = str(row.get("ws_shard_id") or "")
+                if shard_id:
+                    try:
+                        row_shard_symbol_count = int(row.get("ws_shard_symbol_count") or 0)
+                    except (TypeError, ValueError):
+                        row_shard_symbol_count = 0
+                    prior_ex_min = int(shard_exchange_min.get(shard_id, 0)) if isinstance(shard_exchange_min, dict) else 0
+                    prior_in_min = int(shard_ingest_min.get(shard_id, 0)) if isinstance(shard_ingest_min, dict) else 0
+                    prior_in_max = int(shard_ingest_max.get(shard_id, 0)) if isinstance(shard_ingest_max, dict) else 0
+                    if isinstance(shard_exchange_min, dict) and row_exchange_event_ms > 0:
+                        shard_exchange_min[shard_id] = (
+                            row_exchange_event_ms
+                            if prior_ex_min <= 0
+                            else min(prior_ex_min, row_exchange_event_ms)
+                        )
+                    if isinstance(shard_ingest_min, dict):
+                        shard_ingest_min[shard_id] = (
+                            row_service_ingest_ms
+                            if prior_in_min <= 0
+                            else min(prior_in_min, row_service_ingest_ms)
+                        )
+                    if isinstance(shard_ingest_max, dict):
+                        shard_ingest_max[shard_id] = max(prior_in_max, row_service_ingest_ms)
+                    if isinstance(shard_symbol_counts, dict):
+                        shard_symbol_counts[shard_id] = max(
+                            int(shard_symbol_counts.get(shard_id, 0)),
+                            row_shard_symbol_count,
+                        )
         if first_publish_ms <= 0:
             metric_values["first_publish_ms"] = publish_ms
         else:
             metric_values["first_publish_ms"] = min(first_publish_ms, publish_ms)
         metric_values["last_push_done_ms"] = max(last_push_done_ms, push_done_ms)
+        metric_values["exchange_event_min_ms"] = exchange_event_min_ms
+        metric_values["service_ingest_min_ms"] = service_ingest_min_ms
+        metric_values["service_ingest_max_ms"] = service_ingest_max_ms
 
         shard_push_done_ms = max(
             0,
             int(metric_values["last_push_done_ms"]) - int(metric_values["first_publish_ms"]),
         )
+        full_arrival_ms = (
+            max(0, service_ingest_max_ms - exchange_event_min_ms)
+            if service_ingest_max_ms > 0 and exchange_event_min_ms > 0
+            else 0
+        )
+        ingest_spread_ms = (
+            max(0, service_ingest_max_ms - service_ingest_min_ms)
+            if service_ingest_max_ms > 0 and service_ingest_min_ms > 0
+            else 0
+        )
+        shard_arrival_lines: list[str] = []
+        if isinstance(shard_ingest_max, dict) and isinstance(shard_exchange_min, dict):
+            sorted_shards = sorted(shard_ingest_max.keys())
+            for idx, shard_id in enumerate(sorted_shards):
+                try:
+                    shard_ingest_max_ms = int(shard_ingest_max.get(shard_id, 0))
+                    shard_exchange_min_ms = int(shard_exchange_min.get(shard_id, 0))
+                except (TypeError, ValueError):
+                    continue
+                if shard_ingest_max_ms <= 0 or shard_exchange_min_ms <= 0:
+                    continue
+                shard_symbols = 0
+                if isinstance(shard_symbol_counts, dict):
+                    try:
+                        shard_symbols = int(shard_symbol_counts.get(shard_id, 0))
+                    except (TypeError, ValueError):
+                        shard_symbols = 0
+                shard_arrival_lines.append(
+                    f"第{idx + 1}分片：symbols={shard_symbols} 到齐耗时={max(0, shard_ingest_max_ms - shard_exchange_min_ms)}ms",
+                )
+        shard_arrival_text = "；".join(shard_arrival_lines) if shard_arrival_lines else "n=0"
+        round_b2s_text = "n=0"
+        if isinstance(cast_round_sizes, list) and isinstance(cast_round_b2s, list):
+            total_rounds = min(len(cast_round_sizes), len(cast_round_b2s))
+            round_b2s_lines: list[str] = []
+            for idx in range(total_rounds):
+                try:
+                    round_sz = int(cast_round_sizes[idx])
+                    round_ms = int(cast_round_b2s[idx])
+                except (TypeError, ValueError):
+                    continue
+                round_b2s_lines.append(f"第{idx + 1}次：symbols={round_sz} 到达耗时={round_ms}ms")
+            if round_b2s_lines:
+                round_b2s_text = "；".join(round_b2s_lines)
+        delayed_top_text = "n=0"
+        if isinstance(cast_delayed_tokens, list) and cast_delayed_tokens:
+            delayed_sorted = sorted(
+                [x for x in cast_delayed_tokens if isinstance(x, dict)],
+                key=lambda x: int(x.get("wait_ms", 0)),
+                reverse=True,
+            )[:10]
+            delayed_parts: list[str] = []
+            for item in delayed_sorted:
+                symbol = str(item.get("symbol") or "")
+                wait_ms = int(item.get("wait_ms") or 0)
+                readable_close = self._format_close_time(item.get("close_time_ms"))
+                delayed_parts.append(f"{symbol}:等待{wait_ms}ms(close={readable_close})")
+            if delayed_parts:
+                delayed_top_text = "；".join(delayed_parts)
 
         self._batch_summary_by_close[close_time_key] = {
             "close_time_ms": close_time_key,
@@ -1201,6 +1361,11 @@ class App:
             "service_to_client_no_ack": self._format_stats(cast_s2c if isinstance(cast_s2c, list) else []),
             "connected_clients": int(metric_values["connected_clients"]),
             "service_ws_shards_push_done_ms": shard_push_done_ms,
+            "binance_to_service_full_arrival_ms": full_arrival_ms,
+            "service_ingest_spread_ms": ingest_spread_ms,
+            "binance_to_service_shard_arrival_ms": shard_arrival_text,
+            "binance_to_service_round_arrival_ms": round_b2s_text,
+            "delayed_tokens_top10": delayed_top_text,
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
@@ -1247,8 +1412,13 @@ class App:
             f"REST条数：{batch.get('rest_count', 0)}\n"
             f"服务端直推耗时（全部分片）：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
+            f"Binance到服务端（全量到齐耗时）：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
+            f"Binance到服务端（分片到齐耗时）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
+            f"Binance到服务端（全部分片轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
+            f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
             f"服务端WSS分片全部推送完成耗时：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
+            f"延迟代币Top10：{batch.get('delayed_tokens_top10', 'n=0')}\n"
             f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
             f"批次ACK上报客户端数：{batch_ack_clients}\n"
             f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
