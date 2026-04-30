@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Mock downstream WebSocket consumer for alerts feed",
     )
-    parser.add_argument("--ws-url", default="ws://172.33.178.40:8765/ws/alerts")
+    parser.add_argument("--ws-url", default="wss://datahub.questvector.ai/ws/alerts")
     parser.add_argument("--max-messages", type=int, default=0, help="0 means run forever")
     return parser.parse_args()
 

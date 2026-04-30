@@ -994,10 +994,11 @@ class App:
             logger.info("ack.unknown event_id=%s", event_id)
             return
 
+        server_ingress_ms = int(time.time() * 1000)
         ev.downstream_receive_ms = downstream_receive_ms
         ev.downstream_region = downstream_region or None
-        e2e = ev.end_to_end_ms()
-        svc_to_downstream = ev.service_to_downstream_ms()
+        svc_to_downstream = max(0, server_ingress_ms - ev.service_publish_ms)
+        e2e = max(0, server_ingress_ms - ev.exchange_event_ms)
         region_ok = ev.region_aligned()
         logger.info(
             "latency.final event_id=%s symbol=%s e2e_ms=%s exchange_to_service_ms=%s "
@@ -1011,9 +1012,9 @@ class App:
             ev.downstream_region,
             region_ok,
         )
-        if close_time_ms is not None and svc_to_downstream is not None:
+        if close_time_ms is not None:
             self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
-            ingest_to_downstream = max(0, downstream_receive_ms - ev.service_ingest_ms)
+            ingest_to_downstream = max(0, server_ingress_ms - ev.service_ingest_ms)
             self._ack_ingest_to_downstream_by_close.setdefault(close_time_ms, []).append(int(ingest_to_downstream))
             if sender_client_id is not None:
                 self._ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)

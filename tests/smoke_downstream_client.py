@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Mock downstream WebSocket consumer for closed kline feed",
     )
-    parser.add_argument("--ws-url", default="ws://172.33.178.40:8766/ws/klines")
+    parser.add_argument("--ws-url", default="wss://datahub.questvector.ai/ws/kline")
     parser.add_argument("--max-messages", type=int, default=0, help="0 means run forever")
     parser.add_argument("--downstream-region", default="ap-northeast-1")
     parser.add_argument(
