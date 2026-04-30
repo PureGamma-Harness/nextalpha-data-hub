@@ -41,7 +41,7 @@ redis:
   pending_latency_max: 100000
 
 alerts:
-  threshold_1m_pct: 10.0
+  threshold_1m_pct: 2.0
   threshold_5m_pct: 15.0
   threshold_1h_pct: 25.0
   threshold_4h_pct: 40.0
