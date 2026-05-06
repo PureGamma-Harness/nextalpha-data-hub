@@ -64,6 +64,8 @@ websocket:
   klines_port: 8766
   # 生产建议为 1h；压测/联调可临时改为 5m
   klines_interval: 1h
+  # 分片内凑齐超时则先推送该分片已有数据（毫秒）
+  klines_passthrough_shard_max_wait_ms: 100
   klines_replay_count: 3
   # 超时补刷等待时间（毫秒）；仅在 klines_full_batch_only=false 时生效
   klines_flush_grace_ms: 20000
