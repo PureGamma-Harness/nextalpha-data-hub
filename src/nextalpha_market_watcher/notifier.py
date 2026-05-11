@@ -30,3 +30,14 @@ class Notifier:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(self._cfg.url, json=payload)
             resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.info("notify.sent title=%s status=%s body=<non-json>", title, resp.status_code)
+                return
+            if isinstance(data, dict):
+                code = data.get("code")
+                if code not in (None, 0):
+                    msg = data.get("msg") or data.get("message") or data
+                    raise RuntimeError(f"lark webhook rejected message code={code} msg={msg}")
+            logger.info("notify.sent title=%s status=%s code=%s", title, resp.status_code, data.get("code") if isinstance(data, dict) else None)
