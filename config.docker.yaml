@@ -68,6 +68,8 @@ websocket:
   klines_interval: 5m
   # 分片模式：每条WS连接承载约200个symbol
   klines_ws_batch_size: 200
+  # false：同一收盘时刻在服务端聚齐后整批一次下发（与生产一致）
+  klines_passthrough_mode: false
   klines_replay_count: 3
   # 全量模式：优先等全量；达到等待上限后可按容忍缺失阈值放行
   klines_full_batch_only: true

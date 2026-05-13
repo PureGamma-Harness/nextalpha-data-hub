@@ -440,6 +440,15 @@ class App:
                 row["batch_sent_shards"] = batch_sent_shards
                 row["batch_total_shards"] = batch_total_shards
                 row["batch_done"] = batch_done
+        elif payload:
+            # 聚合模式：一次 flush 即整批对外推送，便于下游 batch_ack 对齐 batch_push_done_ms
+            batch_done = True
+            batch_sent_shards = 1
+            batch_total_shards = 1
+            for row in payload:
+                row["batch_sent_shards"] = batch_sent_shards
+                row["batch_total_shards"] = batch_total_shards
+                row["batch_done"] = True
         batch_push_done_ms = int(time.time() * 1000)
         for row in payload:
             row["batch_push_done_ms"] = batch_push_done_ms
@@ -1386,6 +1395,14 @@ class App:
         raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
         round_sizes = raw_metrics.get("push_round_sizes", [])
         round_no_ack = raw_metrics.get("push_round_no_ack_ms", [])
+        if self._klines_passthrough_mode:
+            push_stage_header = "服务端分片直推耗时（按推送轮次）"
+            round_ms_label = "直推耗时"
+            post_push_ack_label = "分片全部推送后"
+        else:
+            push_stage_header = "服务端整批一次推送耗时（按推送轮次）"
+            round_ms_label = "推送耗时"
+            post_push_ack_label = "整批推送后"
         round_lines: list[str] = []
         if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
             total_rounds = min(len(round_sizes), len(round_no_ack))
@@ -1395,7 +1412,7 @@ class App:
                     round_ms = int(round_no_ack[idx])
                 except (TypeError, ValueError):
                     continue
-                round_lines.append(f"第{idx + 1}次：symbols={round_sz} 直推耗时={round_ms}ms")
+                round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
         direct_push_stage_text = "；".join(round_lines) if round_lines else "n=0"
         ack_line = (
             f"服务端到客户端(ACK)：{self._format_stats(values)}"
@@ -1404,19 +1421,20 @@ class App:
         )
         body = (
             "【K线批次与ACK汇总】\n"
+            f"推送模式：{'分片到达即推送（多轮）' if self._klines_passthrough_mode else '服务端聚合后整批一次下发'}\n"
             f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
             f"推送数量：{batch.get('batch_size', expected)}\n"
             f"期望总数：{batch.get('expected_symbols', expected)}\n"
             f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
             f"WS条数：{batch.get('ws_count', 0)}\n"
             f"REST条数：{batch.get('rest_count', 0)}\n"
-            f"服务端直推耗时（全部分片）：{direct_push_stage_text}\n"
+            f"{push_stage_header}：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"批次首事件到末入站耗时：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
             f"Binance到服务端（分片到齐耗时）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
             f"Binance到服务端（全部分片轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
             f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
-            f"服务端WSS分片全部推送完成耗时：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
+            f"服务端推送完成跨度（首轮 publish 至末轮 push_done）：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
             f"延迟代币Top10：{batch.get('delayed_tokens_top10', 'n=0')}\n"
             f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
@@ -1424,10 +1442,10 @@ class App:
             f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
             f"批次计算ACK上报客户端数：{batch_compute_ack_clients}\n"
             f"批次下单ACK上报客户端数：{batch_order_ack_clients}\n"
-            f"分片全部推送后批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
-            f"分片全部推送后整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
-            f"分片全部推送后计算ACK耗时：{self._format_stats(batch_done_to_compute_ack_values)}\n"
-            f"分片全部推送后下单ACK耗时：{self._format_stats(batch_done_to_order_ack_values)}\n"
+            f"{post_push_ack_label}批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
+            f"{post_push_ack_label}整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
+            f"{post_push_ack_label}计算ACK耗时：{self._format_stats(batch_done_to_compute_ack_values)}\n"
+            f"{post_push_ack_label}下单ACK耗时：{self._format_stats(batch_done_to_order_ack_values)}\n"
         )
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
