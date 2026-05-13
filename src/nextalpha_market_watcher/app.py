@@ -1294,6 +1294,9 @@ class App:
         metric_values["service_ingest_min_ms"] = service_ingest_min_ms
         metric_values["service_ingest_max_ms"] = service_ingest_max_ms
 
+        final_push_done_ms = int(metric_values["last_push_done_ms"])
+        close_to_push_done_ms = final_push_done_ms - close_time_key
+
         shard_push_done_ms = max(
             0,
             int(metric_values["last_push_done_ms"]) - int(metric_values["first_publish_ms"]),
@@ -1375,6 +1378,8 @@ class App:
             "binance_to_service_shard_arrival_ms": shard_arrival_text,
             "binance_to_service_round_arrival_ms": round_b2s_text,
             "delayed_tokens_top10": delayed_top_text,
+            "last_batch_push_done_ms": final_push_done_ms,
+            "close_time_to_push_done_ms": close_to_push_done_ms,
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
@@ -1409,10 +1414,26 @@ class App:
                     continue
                 round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
         direct_push_stage_text = "；".join(round_lines) if round_lines else "n=0"
+        ctp = batch.get("close_time_to_push_done_ms")
+        if isinstance(ctp, int):
+            ctp_line = f"{ctp:+d}ms"
+        elif ctp is None:
+            ctp_line = "n/a"
+        else:
+            ctp_line = str(ctp)
+        lpd = batch.get("last_batch_push_done_ms")
+        if isinstance(lpd, int):
+            lpd_line = str(lpd)
+        elif lpd is None:
+            lpd_line = "n/a"
+        else:
+            lpd_line = str(lpd)
         body = (
             "【K线批次与ACK汇总】\n"
             f"推送模式：{'随到齐即一次性推送（多轮统计）' if self._klines_passthrough_mode else '服务端聚合后整批一次性下发'}\n"
             f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
+            f"收盘至推送完成（K线 close_time_ms → 本批最后一次 WebSocket 写出）：{ctp_line}\n"
+            f"（末次 push_done_ms={lpd_line}；close_time_ms 为 Binance 返回的当根 K 线最后一毫秒）\n"
             f"推送数量：{batch.get('batch_size', expected)}\n"
             f"期望总数：{batch.get('expected_symbols', expected)}\n"
             f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"

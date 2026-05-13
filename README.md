@@ -125,6 +125,7 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 - **K线批次与ACK汇总**（单条合并消息）包含：
   - 推送模式（聚合整批一次性下发 / 随到齐即一次性推送多轮统计）
   - 收盘时间（格式化 `YYYY-MM-DD HH:MM:SS`）
+  - **收盘至推送完成**：`last_push_done_ms - close_time_ms`（`close_time_ms` 为 Binance 当根最后一毫秒；`last_push_done_ms` 为本批最后一次 WebSocket 写出；passthrough 多轮时取末轮）
   - 推送数量/期望总数/缺失数量
   - WS/REST 条数
   - Binance到服务端、服务端整合耗时、服务端到客户端（不含ACK）、服务端到客户端（ACK）
