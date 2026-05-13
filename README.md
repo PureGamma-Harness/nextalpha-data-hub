@@ -123,7 +123,7 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 ### 6) Lark 推送内容（当前）
 
 - **K线批次与ACK汇总**（单条合并消息）包含：
-  - 推送模式（聚合整批一次下发 / 分片多轮直推）
+  - 推送模式（聚合整批一次性下发 / 随到齐即一次性推送多轮统计）
   - 收盘时间（格式化 `YYYY-MM-DD HH:MM:SS`）
   - 推送数量/期望总数/缺失数量
   - WS/REST 条数
@@ -147,7 +147,7 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 为了模拟策略端接入（直连 WebSocket），项目提供了 `tests/smoke_downstream_client.py`：
 
 ```bash
-python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8766/ws/klines
+python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8766/ws/klines --klines-interval 1h
 ```
 
 完整说明见 `tests/README.md`。

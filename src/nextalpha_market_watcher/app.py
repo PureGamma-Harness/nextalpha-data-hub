@@ -1326,7 +1326,7 @@ class App:
                     except (TypeError, ValueError):
                         shard_symbols = 0
                 shard_arrival_lines.append(
-                    f"第{idx + 1}分片：symbols={shard_symbols} 到齐耗时={max(0, shard_ingest_max_ms - shard_exchange_min_ms)}ms",
+                    f"第{idx + 1}路一次性推送：symbols={shard_symbols} 到齐耗时={max(0, shard_ingest_max_ms - shard_exchange_min_ms)}ms",
                 )
         shard_arrival_text = "；".join(shard_arrival_lines) if shard_arrival_lines else "n=0"
         round_b2s_text = "n=0"
@@ -1395,14 +1395,9 @@ class App:
         raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
         round_sizes = raw_metrics.get("push_round_sizes", [])
         round_no_ack = raw_metrics.get("push_round_no_ack_ms", [])
-        if self._klines_passthrough_mode:
-            push_stage_header = "服务端分片直推耗时（按推送轮次）"
-            round_ms_label = "直推耗时"
-            post_push_ack_label = "分片全部推送后"
-        else:
-            push_stage_header = "服务端整批一次推送耗时（按推送轮次）"
-            round_ms_label = "推送耗时"
-            post_push_ack_label = "整批推送后"
+        push_stage_header = "服务端一次性推送耗时（按推送轮次）"
+        round_ms_label = "单次推送耗时"
+        post_push_ack_label = "一次性推送全部完成后"
         round_lines: list[str] = []
         if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
             total_rounds = min(len(round_sizes), len(round_no_ack))
@@ -1414,14 +1409,9 @@ class App:
                     continue
                 round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
         direct_push_stage_text = "；".join(round_lines) if round_lines else "n=0"
-        ack_line = (
-            f"服务端到客户端(ACK)：{self._format_stats(values)}"
-            if values
-            else "服务端到客户端(ACK)：n=0"
-        )
         body = (
             "【K线批次与ACK汇总】\n"
-            f"推送模式：{'分片到达即推送（多轮）' if self._klines_passthrough_mode else '服务端聚合后整批一次下发'}\n"
+            f"推送模式：{'随到齐即一次性推送（多轮统计）' if self._klines_passthrough_mode else '服务端聚合后整批一次性下发'}\n"
             f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
             f"推送数量：{batch.get('batch_size', expected)}\n"
             f"期望总数：{batch.get('expected_symbols', expected)}\n"
@@ -1431,8 +1421,8 @@ class App:
             f"{push_stage_header}：{direct_push_stage_text}\n"
             f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
             f"批次首事件到末入站耗时：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
-            f"Binance到服务端（分片到齐耗时）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
-            f"Binance到服务端（全部分片轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
+            f"Binance到服务端（全市场一次性推送到齐）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
+            f"Binance到服务端（一次性推送接收轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
             f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
             f"服务端推送完成跨度（首轮 publish 至末轮 push_done）：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"

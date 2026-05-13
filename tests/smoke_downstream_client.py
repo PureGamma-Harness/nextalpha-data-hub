@@ -19,6 +19,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-messages", type=int, default=0, help="0 means run forever")
     parser.add_argument("--downstream-region", default="ap-northeast-1")
     parser.add_argument(
+        "--klines-interval",
+        default="1h",
+        help="Hint only: server klines bar size (e.g. 1h prod, 5m dev); used in wait-timeout log message",
+    )
+    parser.add_argument(
         "--ack-enabled",
         action="store_true",
         help="Send ack payloads back to service over the same websocket",
@@ -61,7 +66,11 @@ async def _run() -> None:
                                 {
                                     "event": "downstream.waiting",
                                     "seconds_without_message": 15,
-                                    "hint": "5m kline arrives on each 5m candle close (temporary mode)",
+                                    "klines_interval_hint": args.klines_interval,
+                                    "hint": (
+                                        f"No batch yet; {args.klines_interval} bars emit after each "
+                                        f"close (matches server websocket.klines_interval)"
+                                    ),
                                 },
                                 ensure_ascii=False,
                             ),

@@ -18,12 +18,14 @@ docker compose up -d --build
 ```bash
 python tests/smoke_downstream_client.py \
   --ws-url ws://127.0.0.1:8766/ws/klines \
+  --klines-interval 1h \
   --ack-enabled \
   --downstream-region ap-northeast-1
 ```
 
 参数说明：
 
+- `--klines-interval`：仅用于超时等待日志里的周期提示（默认 `1h`，与生产 `websocket.klines_interval` 对齐；联调 5m 时传 `5m`）
 - `--max-messages N`：消费 N 条后自动退出
 - `--ack-enabled`：把 `event_id + downstream_receive_ms + downstream_region` 回传给服务端
 - `--downstream-region`：下游所属 region（用于服务侧 region 对齐统计）
