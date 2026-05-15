@@ -76,13 +76,16 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
     - 推送 Lark 告警通知（中文模板，含客户端连接数）。
 - **K 线链路**（`market-watcher-klines`）：
   - 消费配置周期（当前联调常用 `5m`，生产可切 `1h`）的已收盘 K 线；
+  - 数据源固定为 Binance `@aggTrade` 本地聚合 OHLCV；K线批次服务不再开启 `@kline_<interval>` / `k.x=true` 长连接，避免与 aggTrade 聚合链路争抢 CPU；
+  - 可保留异步 REST K线对账（`websocket.aggtrade_compare_with_kline: true`）：客户端推送不等待验证；REST 对账默认在收盘后 10s 启动；Lark 批次汇总会等待对账结果后再发，超时则先发汇总；
+  - 前几天观测稳定且 REST 验证持续通过后，可将 `websocket.aggtrade_compare_with_kline` 改为 `false`，后续只保留 aggTrade 本地聚合，停止消耗 REST request weight；
   - 按 `close_time_ms` 做“全市场同一收盘时刻批次聚合”；生产默认 `websocket.klines_passthrough_mode: false`，服务端聚齐（或达放行策略）后**整批一次**下发；若改为 `true` 则为分片凑齐或超时后**多轮**直推。
   - 推送到 `ws://<host>:8766/ws/klines`（单条消息为 `list[dict]` 批量）。
 
 ### 2) WebSocket 分片与批次聚合
 
 - **分片规则**：
-  - 按 `websocket.klines_ws_batch_size` 将全量 symbol 分成多个 shard（例如 530 个币、batch_size=200 -> 3 个 shard）；
+  - 按 `websocket.klines_ws_batch_size` 将全量 symbol 分成多个 shard（例如 530 个币、batch_size=80 -> 7 个 shard）；
   - 每个 shard 建立一条 Binance 合并流连接，独立消费。
 - **批次键**：`close_time_ms`
   - 各 shard 的同一收盘时刻数据会汇聚到同一个 `pending_by_close[close_time_ms]`；
