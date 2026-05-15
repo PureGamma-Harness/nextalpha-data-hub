@@ -1607,7 +1607,6 @@ class App:
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
         await asyncio.sleep(max(1, delay_seconds))
-        rest_compare_summary = self._rest_compare_summary_by_close.get(close_time_ms)
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(close_time_ms, [])
         batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(close_time_ms, [])
@@ -1630,38 +1629,50 @@ class App:
             f"{batch.get('batch_size', expected)}/{batch.get('expected_symbols', expected)}"
             f" 缺失={batch.get('missing_symbols', 0)}"
         )
-        ack_client_text = (
-            f"batch={batch_ack_clients} integrated={batch_integrated_ack_clients} "
-            f"compute={batch_compute_ack_clients} order={batch_order_ack_clients}"
-        )
-        ack_stats_parts: list[str] = []
-        for label, samples in (
-            ("batch", batch_done_to_ack_values),
-            ("integrated", batch_done_to_integrated_ack_values),
-            ("compute", batch_done_to_compute_ack_values),
-            ("order", batch_done_to_order_ack_values),
-        ):
-            if samples:
-                ack_stats_parts.append(f"{label}={self._format_stats_compact(samples)}")
-        ack_stats_text = "；".join(ack_stats_parts) if ack_stats_parts else "n=0"
         local_done_label = "收盘边界→本地聚合完成" if self._klines_source == "aggtrade" else "首事件→末入站"
         push_done_label = (
             "本地聚合完成→WS写出完成" if self._klines_source == "aggtrade" else "末条入站→WS写出完成"
         )
-        body = "\n".join(
-            [
-                "【K线批次与ACK汇总】",
-                f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}",
-                f"数据源/模式：{self._klines_source} / {mode_text}",
-                f"REST验证：{self._format_rest_compare_summary(rest_compare_summary)}",
-                f"推送：{count_text} 客户端={batch.get('connected_clients', 0)}",
-                f"收盘→WS写出完成：{self._format_ms_value(batch.get('close_time_to_push_done_ms'), signed=True)}；{push_done_label}：{self._format_ms_value(batch.get('ingest_done_to_push_done_ms'))}",
-                f"{local_done_label}：{self._format_ms_value(batch.get('binance_to_service_full_arrival_ms'))}；接收跨度：{self._format_ms_value(batch.get('service_ingest_spread_ms'))}",
-                f"服务端→客户端(不含ACK)：{s2c_text}",
-                f"ACK客户端：{ack_client_text}",
-                f"ACK耗时：{ack_stats_text}",
-            ]
-        )
+        connected_clients = int(batch.get("connected_clients", 0) or 0)
+        close_to_push_done_ms = batch.get("close_time_to_push_done_ms")
+        lines = [
+            "【K线批次与ACK汇总】",
+            f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}",
+            f"数据源/模式：{self._klines_source} / {mode_text}",
+            f"推送：{count_text} 客户端={connected_clients}",
+            (
+                f"服务端链路：{local_done_label}={self._format_ms_value(batch.get('binance_to_service_full_arrival_ms'))}；"
+                f"{push_done_label}={self._format_ms_value(batch.get('ingest_done_to_push_done_ms'))}；"
+                f"收盘→WS写出完成={self._format_ms_value(close_to_push_done_ms, signed=True)}"
+            ),
+            f"接收跨度：{self._format_ms_value(batch.get('service_ingest_spread_ms'))}；服务端→客户端(不含ACK)：{s2c_text}",
+        ]
+        if connected_clients > 0:
+            ack_client_text = (
+                f"接收={batch_ack_clients} 整合={batch_integrated_ack_clients} "
+                f"计算={batch_compute_ack_clients} 下单={batch_order_ack_clients}"
+            )
+            lines.extend(
+                [
+                    f"ACK客户端：{ack_client_text}",
+                    (
+                        "周期结束→客户端接收完："
+                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_ack_values)}"
+                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_ack_values)}）"
+                    ),
+                    (
+                        "周期结束→计算ACK："
+                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_compute_ack_values)}"
+                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_compute_ack_values)}）"
+                    ),
+                    (
+                        "周期结束→下单ACK："
+                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_order_ack_values)}"
+                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_order_ack_values)}）"
+                    ),
+                ]
+            )
+        body = "\n".join(lines)
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
         except Exception:
@@ -2076,6 +2087,18 @@ class App:
         values_sorted = sorted(values)
         p95 = self._percentile(values_sorted, 95.0)
         return f"n={len(values_sorted)} 本次={values[-1]}ms p95={p95:.0f}ms max={values_sorted[-1]}ms"
+
+    def _format_ack_stats_compact(self, values: list[int]) -> str:
+        if not values:
+            return "未上报"
+        return self._format_stats_compact(values)
+
+    def _format_offset_stats_compact(self, base_ms: object, values: list[int]) -> str:
+        if not values:
+            return "未上报"
+        if not isinstance(base_ms, int):
+            return "n/a"
+        return self._format_stats_compact([max(0, base_ms + value) for value in values])
 
     def _format_ms_value(self, value: object, *, signed: bool = False) -> str:
         if isinstance(value, int):
