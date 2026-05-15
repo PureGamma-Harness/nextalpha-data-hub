@@ -1647,31 +1647,18 @@ class App:
             ),
             f"接收跨度：{self._format_ms_value(batch.get('service_ingest_spread_ms'))}；服务端→客户端(不含ACK)：{s2c_text}",
         ]
-        if connected_clients > 0:
-            ack_client_text = (
-                f"接收={batch_ack_clients} 整合={batch_integrated_ack_clients} "
-                f"计算={batch_compute_ack_clients} 下单={batch_order_ack_clients}"
-            )
-            lines.extend(
-                [
-                    f"ACK客户端：{ack_client_text}",
-                    (
-                        "周期结束→客户端接收完："
-                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_ack_values)}"
-                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_ack_values)}）"
-                    ),
-                    (
-                        "周期结束→计算ACK："
-                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_compute_ack_values)}"
-                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_compute_ack_values)}）"
-                    ),
-                    (
-                        "周期结束→下单ACK："
-                        f"{self._format_offset_stats_compact(close_to_push_done_ms, batch_done_to_order_ack_values)}"
-                        f"（WS写出后：{self._format_ack_stats_compact(batch_done_to_order_ack_values)}）"
-                    ),
-                ]
-            )
+        ack_client_text = (
+            f"接收={batch_ack_clients} 整合={batch_integrated_ack_clients} "
+            f"计算={batch_compute_ack_clients} 下单={batch_order_ack_clients}"
+        )
+        lines.extend(
+            [
+                f"ACK客户端：{ack_client_text}",
+                self._format_batch_ack_latency_line("客户端接收ACK耗时", close_to_push_done_ms, batch_done_to_ack_values),
+                self._format_batch_ack_latency_line("计算ACK耗时", close_to_push_done_ms, batch_done_to_compute_ack_values),
+                self._format_batch_ack_latency_line("下单ACK耗时", close_to_push_done_ms, batch_done_to_order_ack_values),
+            ]
+        )
         body = "\n".join(lines)
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
@@ -2090,12 +2077,20 @@ class App:
 
     def _format_ack_stats_compact(self, values: list[int]) -> str:
         if not values:
-            return "未上报"
+            return "n=0"
         return self._format_stats_compact(values)
+
+    def _format_batch_ack_latency_line(self, label: str, close_to_push_done_ms: object, values: list[int]) -> str:
+        if not values:
+            return f"{label}：n=0"
+        return (
+            f"{label}：周期结束={self._format_offset_stats_compact(close_to_push_done_ms, values)}；"
+            f"WS写出后={self._format_ack_stats_compact(values)}"
+        )
 
     def _format_offset_stats_compact(self, base_ms: object, values: list[int]) -> str:
         if not values:
-            return "未上报"
+            return "n=0"
         if not isinstance(base_ms, int):
             return "n/a"
         return self._format_stats_compact([max(0, base_ms + value) for value in values])

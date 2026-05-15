@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import signal
 import time
@@ -10,7 +11,7 @@ import websockets
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Mock downstream WebSocket consumer for closed kline feed",
+        description="Example downstream WebSocket consumer for closed kline feed",
     )
     parser.add_argument(
         "--ws-url",
@@ -29,6 +30,20 @@ def parse_args() -> argparse.Namespace:
         help="Send ack payloads back to service over the same websocket",
     )
     return parser.parse_args()
+
+
+async def _send_ack(ws: websockets.WebSocketClientProtocol, body: dict) -> None:
+    await ws.send(json.dumps(body, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "event": "downstream.ack_sent",
+                "type": body.get("type"),
+                "close_time_ms": body.get("close_time_ms"),
+            },
+            ensure_ascii=False,
+        ),
+    )
 
 
 async def _run() -> None:
@@ -52,7 +67,6 @@ async def _run() -> None:
             ensure_ascii=False,
         ),
     )
-    integrated_rows_by_close: dict[int, dict[str, dict]] = {}
     while not stop:
         try:
             async with websockets.connect(args.ws_url, ping_interval=20, ping_timeout=20) as ws:
@@ -118,13 +132,6 @@ async def _run() -> None:
                                     batch_push_done_ms = int(row.get("batch_push_done_ms") or 0)
                                 except (TypeError, ValueError):
                                     batch_push_done_ms = 0
-                        try:
-                            close_time_key = int(row.get("close_time_ms") or 0)
-                        except (TypeError, ValueError):
-                            close_time_key = 0
-                        symbol = str(row.get("symbol") or "")
-                        if close_time_key > 0 and symbol:
-                            integrated_rows_by_close.setdefault(close_time_key, {})[symbol] = row
                         event_id = row.get("event_id")
                         if args.ack_enabled and event_id:
                             ack_items.append(
@@ -158,42 +165,7 @@ async def _run() -> None:
                             batch_ack_body["batch_push_done_ms"] = batch_push_done_ms
                         else:
                             batch_ack_body["downstream_receive_ms"] = now_ms
-                        await ws.send(json.dumps(batch_ack_body, ensure_ascii=False))
-                        merged_count = len(integrated_rows_by_close.get(batch_done_close_time_ms, {}))
-                        integrated_body: dict = {
-                            "type": "batch_integrated_ack",
-                            "close_time_ms": batch_done_close_time_ms,
-                            "downstream_region": args.downstream_region,
-                            "merged_symbols": merged_count,
-                        }
-                        if batch_push_done_ms > 0:
-                            integrated_body["batch_push_done_ms"] = batch_push_done_ms
-                        else:
-                            integrated_body["downstream_integrated_ms"] = int(time.time() * 1000)
-                        await ws.send(json.dumps(integrated_body, ensure_ascii=False))
-                        # Mock downstream "compute finished" ack.
-                        compute_body: dict = {
-                            "type": "batch_compute_ack",
-                            "close_time_ms": batch_done_close_time_ms,
-                            "downstream_region": args.downstream_region,
-                        }
-                        if batch_push_done_ms > 0:
-                            compute_body["batch_push_done_ms"] = batch_push_done_ms
-                        else:
-                            compute_body["downstream_compute_ms"] = int(time.time() * 1000)
-                        await ws.send(json.dumps(compute_body, ensure_ascii=False))
-                        # Mock downstream "order finished" ack.
-                        order_body: dict = {
-                            "type": "batch_order_ack",
-                            "close_time_ms": batch_done_close_time_ms,
-                            "downstream_region": args.downstream_region,
-                        }
-                        if batch_push_done_ms > 0:
-                            order_body["batch_push_done_ms"] = batch_push_done_ms
-                        else:
-                            order_body["downstream_order_ms"] = int(time.time() * 1000)
-                        await ws.send(json.dumps(order_body, ensure_ascii=False))
-                        integrated_rows_by_close.pop(batch_done_close_time_ms, None)
+                        await _send_ack(ws, batch_ack_body)
         except Exception as exc:
             if stop:
                 break
@@ -216,6 +188,4 @@ async def _run() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(_run())

@@ -107,13 +107,20 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 ### 4) ACK 回执与延迟口径
 
 - 客户端可回传 ACK（`event_id/downstream_receive_ms/downstream_region`）。
+- K 线批次客户端建议在收到 `batch_done=true` 后继续回传阶段 ACK：
+  - `batch_ack`：整批已接收；
+  - `batch_integrated_ack`：已合并/落入本地状态；
+  - `batch_compute_ack`：策略计算完成；
+  - `batch_order_ack`：下单链路完成。
+  - 没有真实整合/计算/下单阶段时不要模拟回传；服务端会在通知里显示 `n=0`。
 - 服务端维护两类“服务到客户端”口径：
   - **不含 ACK**：从 `service_publish_ms` 到 websocket 广播完成；
-  - **含 ACK**：从 `service_publish_ms` 到收到下游 ACK 的 `downstream_receive_ms`。
+  - **含 ACK**：从 `batch_push_done_ms` 到服务端收到下游阶段 ACK。
 - 核心延迟字段：
   - `exchange_event_ms -> service_ingest_ms`（Binance 到服务）
   - `service_ingest_ms -> service_publish_ms`（服务端整合）
-  - `service_publish_ms -> downstream_receive_ms`（服务到下游，ACK口径）
+  - `close_time_ms -> batch_push_done_ms`（周期结束到服务端写出完成）
+  - `close_time_ms -> batch_compute_ack / batch_order_ack`（周期结束到客户端关键阶段完成）
 
 ### 5) 告警计算细节
 
@@ -126,14 +133,10 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 ### 6) Lark 推送内容（当前）
 
 - **K线批次与ACK汇总**（单条合并消息）包含：
-  - 推送模式（聚合整批一次性下发 / 随到齐即一次性推送多轮统计）
-  - 收盘时间（格式化 `YYYY-MM-DD HH:MM:SS`）
-  - **收盘至推送完成**：`last_push_done_ms - close_time_ms`（`close_time_ms` 为 Binance 当根最后一毫秒；`last_push_done_ms` 为本批最后一次 WebSocket 写出；passthrough 多轮时取末轮）
-  - 推送数量/期望总数/缺失数量
-  - WS/REST 条数
-  - Binance到服务端、服务端整合耗时、服务端到客户端（不含ACK）、服务端到客户端（ACK）
-  - 每项统计均展示：`n`、`本次`、`avg`、`p95`、`min`、`max`
-  - K线客户端连接数、ACK上报客户端数、ACK已回执/期望总数
+  - 收盘时间、数据源/模式、推送数量/期望总数/缺失数量、客户端连接数；
+  - 服务端链路：收盘边界到本地聚合完成、本地聚合完成到 WebSocket 写出完成、收盘到 WebSocket 写出完成；
+  - 固定展示客户端接收 ACK、计算 ACK、下单 ACK 耗时；没有客户端或没有阶段 ACK 时显示 `n=0`；
+  - REST 验证结果不再混在批次通知里，单独发送 `REST验证结果` 并写入 `logs/rest_compare_*.md`。
 - **告警通知**包含：
   - 币种、周期、方向、上一根K线收盘价、当前对比K线收盘价、涨跌幅、触发阈值、告警客户端连接数。
 
@@ -143,12 +146,12 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 - **1m dedupe for alerts**: strictly increasing `open_time_ms` per symbol avoids double-counting when backfill overlaps live WS.
 - **Prometheus**: when `metrics.enabled` is true, `GET /metrics` is served on `metrics.host:metrics.port` (default `0.0.0.0:9090`). Key series: `watcher_klines_received_total`, `watcher_exchange_to_service_ms`, `watcher_backfill_*`, `watcher_klines_published_1h_total`, `watcher_last_ingest_unix_seconds`.
 - **1m window in memory**: each symbol keeps up to ~8h 1m closed candles in memory for multi-interval alert calculation.
-- **Symbol refresh**: periodically re-fetches `exchangeInfo`; when the symbol set changes, ingestion tasks restart and alert state for removed symbols is pruned.
+- **Symbol refresh**: periodically re-fetches `exchangeInfo`; when the symbol set changes, klines apply the new set after the current batch finishes, and alert state for removed symbols is pruned.
 - **Shutdown**: SIGINT/SIGTERM (where supported) stops ingestion gracefully and closes Redis connections. Pending latency tracking is capped at `redis.pending_latency_max` with FIFO eviction.
 
 ## Downstream smoke test
 
-为了模拟策略端接入（直连 WebSocket），项目提供了 `tests/smoke_downstream_client.py`：
+为了验证策略端接入（直连 WebSocket），项目提供了 `tests/smoke_downstream_client.py`：
 
 ```bash
 python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8766/ws/klines --klines-interval 1h
