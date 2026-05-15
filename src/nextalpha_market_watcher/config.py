@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ServiceMode = Literal["alerts", "klines", "all"]
+KlinesSource = Literal["kline", "aggtrade"]
 
 
 class BinanceConfig(BaseModel):
@@ -15,6 +16,8 @@ class BinanceConfig(BaseModel):
     # Optional explicit proxy for WS socket connection.
     # e.g. socks5://host:port
     ws_proxy_url: str | None = None
+    # Optional explicit proxy for Binance REST requests.
+    rest_proxy_url: str | None = None
     ws_watchdog_enabled: bool = True
     ws_watchdog_no_data_periods: int = 2
     ws_watchdog_check_seconds: int = 15
@@ -56,6 +59,8 @@ class AlertsConfig(BaseModel):
 class WebhookConfig(BaseModel):
     enabled: bool = False
     url: str = ""
+    # Optional proxy for Lark webhook calls.
+    proxy_url: str | None = None
     # Optional dedicated webhook for threshold alert notifications.
     # If empty, alerts reuse `url`.
     alerts_url: str = ""
@@ -76,7 +81,30 @@ class WebSocketPushConfig(BaseModel):
     alerts_port: int = 8765
     klines_port: int = 8766
     klines_interval: str = "5m"
+    # Kline batch publishing uses local @aggTrade aggregation.
+    # The legacy "kline" value is accepted for old configs, but App forces it off
+    # so the Kline service does not open a second @kline_<interval> WebSocket.
+    klines_source: KlinesSource = "aggtrade"
     klines_ws_batch_size: int = 200
+    # Only used when klines_source=aggtrade.
+    aggtrade_emit_grace_ms: int = 200
+    # Deprecated compatibility knob. Individual symbol event lag no longer holds
+    # emission or triggers reconnect; shard-level no-data watchdog handles broken WSS.
+    aggtrade_ws_max_event_lag_seconds: float = 0.0
+    # Deprecated compatibility knob. Late trades for already emitted bars are ignored silently.
+    aggtrade_late_trade_log_limit_per_close: int = 0
+    # Legacy field name: when true, compare local aggTrade bars with REST klines;
+    # this does not open a @kline_<interval> WebSocket. After a stable observation
+    # window, set it to false to stop spending REST request weight on validation.
+    aggtrade_compare_with_kline: bool = True
+    aggtrade_rest_compare_delay_seconds: float = 10.0
+    aggtrade_rest_compare_concurrency: int = 8
+    aggtrade_rest_compare_lark_timeout_seconds: float = 120.0
+    # aggTrade is a live trade stream; it should not be silent for whole kline periods.
+    aggtrade_ws_watchdog_stale_seconds: int = 30
+    aggtrade_price_tolerance: str = "0"
+    aggtrade_volume_tolerance: str = "0.00000001"
+    aggtrade_quote_tolerance: str = "0.000001"
     # If True, publish each closed kline row immediately to downstream clients
     # without server-side close_time batch aggregation.
     klines_passthrough_mode: bool = False

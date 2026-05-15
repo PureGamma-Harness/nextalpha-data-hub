@@ -9,6 +9,6 @@ COPY pyproject.toml README.md requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src /app/src
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps --no-build-isolation .
 
 CMD ["nextalpha-watcher", "run", "--config", "/app/config.yaml"]

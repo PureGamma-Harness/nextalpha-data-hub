@@ -50,3 +50,4 @@ services:
         hard: 65535
     volumes:
       - ./config.prod.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs

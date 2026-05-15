@@ -53,3 +53,4 @@ services:
         hard: 65535
     volumes:
       - ./config.docker.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs

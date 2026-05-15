@@ -27,7 +27,7 @@ class Notifier:
                 "text": f"{title}\n{body}",
             },
         }
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=5.0, proxy=self._cfg.proxy_url) as client:
             resp = await client.post(self._cfg.url, json=payload)
             resp.raise_for_status()
             try:

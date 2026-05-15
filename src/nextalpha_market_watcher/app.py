@@ -6,6 +6,8 @@ import math
 import time
 from collections import deque
 from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import orjson
@@ -39,6 +41,7 @@ class App:
             WebhookConfig(
                 enabled=cfg.webhook.enabled,
                 url=alerts_webhook_url,
+                proxy_url=cfg.webhook.proxy_url,
                 alerts_url=cfg.webhook.alerts_url,
             ),
         )
@@ -78,6 +81,13 @@ class App:
         self._max_missing_symbols = max(0, self._cfg.websocket.klines_max_missing_symbols)
         self._pending_lock = asyncio.Lock()
         self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
+        configured_klines_source = self._cfg.websocket.klines_source
+        if cfg.service_mode in ("klines", "all") and configured_klines_source != "aggtrade":
+            logger.warning(
+                "klines.kline_ws.disabled configured_source=%s effective_source=aggtrade",
+                configured_klines_source,
+            )
+        self._klines_source = "aggtrade"
         self._klines_ws_batch_size = max(1, self._cfg.websocket.klines_ws_batch_size)
         self._klines_passthrough_mode = bool(self._cfg.websocket.klines_passthrough_mode)
         self._rest_repair_delay_ms = self._resolve_rest_repair_delay_ms(self._klines_interval)
@@ -102,6 +112,8 @@ class App:
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
         self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
+        self._rest_compare_summary_by_close: dict[int, dict[str, int | float | str | bool]] = {}
+        self._rest_compare_events_by_close: dict[int, asyncio.Event] = {}
         self._passthrough_shards_sent_by_close: dict[int, set[str]] = {}
         self._passthrough_total_shards_by_close: dict[int, int] = {}
         self._batch_done_publish_ms_by_close: dict[int, int] = {}
@@ -313,9 +325,61 @@ class App:
             for close_ms, rows, first_ingest in flush_items:
                 await self._enqueue_publish(close_ms, rows, first_ingest)
 
+    def _publish_kline_iter(self, symbols: list[str]):
+        return self._binance.iter_aggtrade_klines(
+            symbols,
+            interval=self._klines_interval,
+            batch_size=self._klines_ws_batch_size,
+            emit_grace_ms=max(0, self._cfg.websocket.aggtrade_emit_grace_ms),
+            compare_with_rest_kline=self._cfg.websocket.aggtrade_compare_with_kline,
+            rest_compare_delay_seconds=max(
+                0.0,
+                self._cfg.websocket.aggtrade_rest_compare_delay_seconds,
+            ),
+            rest_compare_concurrency=max(
+                1,
+                self._cfg.websocket.aggtrade_rest_compare_concurrency,
+            ),
+            price_tolerance=self._decimal_config(
+                self._cfg.websocket.aggtrade_price_tolerance,
+                Decimal("0"),
+            ),
+            volume_tolerance=self._decimal_config(
+                self._cfg.websocket.aggtrade_volume_tolerance,
+                Decimal("0.00000001"),
+            ),
+            quote_tolerance=self._decimal_config(
+                self._cfg.websocket.aggtrade_quote_tolerance,
+                Decimal("0.000001"),
+            ),
+            rest_compare_summary_callback=self._on_aggtrade_rest_compare_summary,
+        )
+
+    async def _on_aggtrade_rest_compare_summary(self, summary: dict[str, int | float | str | bool]) -> None:
+        try:
+            close_time_ms = int(summary.get("close_time_ms") or 0)
+        except (TypeError, ValueError):
+            return
+        if close_time_ms <= 0:
+            return
+        self._rest_compare_summary_by_close[close_time_ms] = summary
+        event = self._rest_compare_events_by_close.setdefault(close_time_ms, asyncio.Event())
+        event.set()
+        asyncio.create_task(self._notify_rest_compare_summary(summary))
+
+    def _decimal_config(self, value: str, default: Decimal) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except Exception:
+            logger.warning("config.decimal_invalid value=%s default=%s", value, default)
+            return default
+
+    def _is_live_ws_source(self, source: str) -> bool:
+        return source in ("ws", "aggtrade")
+
     async def _run_1h_publish(self, symbols: list[str]) -> None:
         if self._klines_ws is None:
-            async for _ in self._binance.iter_closed_klines(symbols, interval=self._klines_interval):
+            async for _ in self._publish_kline_iter(symbols):
                 self._ingest_1h += 1
             return
 
@@ -334,11 +398,14 @@ class App:
         self._published_close_order.clear()
         latest_close_by_symbol: dict[str, int] = {}
 
-        async for kline in self._binance.iter_closed_klines(
-            symbols,
-            interval=self._klines_interval,
-            batch_size=self._klines_ws_batch_size,
-        ):
+        logger.info(
+            "klines.publish.source interval=%s source=%s compare_with_rest_kline=%s",
+            self._klines_interval,
+            self._klines_source,
+            self._cfg.websocket.aggtrade_compare_with_kline if self._klines_source == "aggtrade" else False,
+        )
+
+        async for kline in self._publish_kline_iter(symbols):
             prev_close = latest_close_by_symbol.get(kline.symbol)
             if prev_close is not None and kline.close_time_ms <= prev_close:
                 continue
@@ -369,8 +436,11 @@ class App:
                     "service_ingest_ms": kline.ingest_time_ms,
                     "service_region": self._cfg.service_region,
                     "source": kline.source,
+                    "ws_shard_id": kline.ws_shard_id,
+                    "ws_shard_symbol_count": kline.ws_shard_symbol_count,
+                    "ws_total_shards": kline.ws_total_shards,
                 }
-                if kline.source == "ws":
+                if self._is_live_ws_source(kline.source):
                     self._pending_has_ws[kline.close_time_ms] = True
                 if len(rows_by_symbol) >= min_required:
                     complete_rows = self._pending_by_close.pop(kline.close_time_ms, {})
@@ -418,6 +488,24 @@ class App:
         payload = [dict(row, service_publish_ms=publish_ms) for row in rows_by_symbol.values()]
         payload.sort(key=lambda row: row["symbol"])
         await self._record_published_latency_state(payload)
+        if self._klines_source == "aggtrade" and self._cfg.websocket.aggtrade_compare_with_kline:
+            compare_symbols = {
+                str(row.get("symbol") or "")
+                for row in payload
+                if self._is_live_ws_source(str(row.get("source") or ""))
+            }
+            compare_symbols.discard("")
+            if compare_symbols:
+                try:
+                    await self._binance.request_aggtrade_rest_compare(
+                        self._klines_interval,
+                        close_time_ms,
+                        compare_symbols,
+                    )
+                except Exception:
+                    logger.exception("aggtrade.rest_compare.request_failed close_time_ms=%s", close_time_ms)
+        if self._klines_source == "aggtrade":
+            self._binance.mark_aggtrade_close_published(self._klines_interval, close_time_ms)
         if self._klines_recent.maxlen and self._klines_recent.maxlen > 0:
             async with self._klines_recent_lock:
                 self._klines_recent.append(payload)
@@ -472,7 +560,7 @@ class App:
             got_ratio = (got_symbols / expected_symbols) if expected_symbols > 0 else 0.0
             missing_list = sorted(self._expected_symbols - set(rows_by_symbol.keys()))
         missing_sample = ",".join(missing_list[:20]) if missing_list else "-"
-        ws_count = sum(1 for row in payload if row.get("source") == "ws")
+        ws_count = sum(1 for row in payload if self._is_live_ws_source(str(row.get("source") or "")))
         rest_count = len(payload) - ws_count
         full_batch_wait_ms = None
         if first_ingest_ms is not None:
@@ -658,7 +746,10 @@ class App:
 
         timeout_seconds = max(5.0, self._cfg.backfill.rest_timeout_seconds)
         repaired = 0
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds),
+            proxy=self._cfg.binance.rest_proxy_url,
+        ) as client:
             for symbol in missing_symbols:
                 async with self._pending_lock:
                     rows_now = self._pending_by_close.get(close_time_ms)
@@ -873,7 +964,13 @@ class App:
                 self._ack_service_to_downstream_by_close.setdefault(close_time_ms, [])
                 if close_time_ms not in self._ack_notify_scheduled:
                     self._ack_notify_scheduled.add(close_time_ms)
-                    asyncio.create_task(self._notify_ack_summary_later(close_time_ms, delay_seconds=20))
+                    delay_seconds = 20
+                    if self._klines_source == "aggtrade":
+                        delay_seconds = max(
+                            1,
+                            math.ceil(self._cfg.websocket.aggtrade_rest_compare_delay_seconds),
+                        )
+                    asyncio.create_task(self._notify_ack_summary_later(close_time_ms, delay_seconds=delay_seconds))
 
     def _build_published_latency_events(self, payload: list[dict]) -> list[dict[str, str]]:
         events: list[dict[str, str]] = []
@@ -1315,10 +1412,23 @@ class App:
 
         final_push_done_ms = int(metric_values["last_push_done_ms"])
         close_to_push_done_ms = final_push_done_ms - close_time_key
+        period_boundary_ms = close_time_key + 1
+        period_boundary_to_push_done_ms = final_push_done_ms - period_boundary_ms
+        first_publish_final = int(metric_values["first_publish_ms"])
+        ingest_done_to_publish_start_ms = (
+            max(0, first_publish_final - service_ingest_max_ms)
+            if first_publish_final > 0 and service_ingest_max_ms > 0
+            else 0
+        )
+        ingest_done_to_push_done_ms = (
+            max(0, final_push_done_ms - service_ingest_max_ms)
+            if final_push_done_ms > 0 and service_ingest_max_ms > 0
+            else 0
+        )
 
         shard_push_done_ms = max(
             0,
-            int(metric_values["last_push_done_ms"]) - int(metric_values["first_publish_ms"]),
+            final_push_done_ms - first_publish_final,
         )
         full_arrival_ms = (
             max(0, service_ingest_max_ms - exchange_event_min_ms)
@@ -1399,10 +1509,14 @@ class App:
             "delayed_tokens_top10": delayed_top_text,
             "last_batch_push_done_ms": final_push_done_ms,
             "close_time_to_push_done_ms": close_to_push_done_ms,
+            "period_boundary_to_push_done_ms": period_boundary_to_push_done_ms,
+            "ingest_done_to_publish_start_ms": ingest_done_to_publish_start_ms,
+            "ingest_done_to_push_done_ms": ingest_done_to_push_done_ms,
         }
 
     async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
         await asyncio.sleep(max(1, delay_seconds))
+        rest_compare_summary = self._rest_compare_summary_by_close.get(close_time_ms)
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
         ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(close_time_ms, [])
@@ -1440,6 +1554,27 @@ class App:
             ctp_line = "n/a"
         else:
             ctp_line = str(ctp)
+        pbp = batch.get("period_boundary_to_push_done_ms")
+        if isinstance(pbp, int):
+            pbp_line = f"{pbp:+d}ms"
+        elif pbp is None:
+            pbp_line = "n/a"
+        else:
+            pbp_line = str(pbp)
+        idp = batch.get("ingest_done_to_push_done_ms")
+        if isinstance(idp, int):
+            idp_line = f"{idp}ms"
+        elif idp is None:
+            idp_line = "n/a"
+        else:
+            idp_line = str(idp)
+        ids = batch.get("ingest_done_to_publish_start_ms")
+        if isinstance(ids, int):
+            ids_line = f"{ids}ms"
+        elif ids is None:
+            ids_line = "n/a"
+        else:
+            ids_line = str(ids)
         lpd = batch.get("last_batch_push_done_ms")
         if isinstance(lpd, int):
             lpd_line = str(lpd)
@@ -1447,11 +1582,30 @@ class App:
             lpd_line = "n/a"
         else:
             lpd_line = str(lpd)
+        if self._klines_source == "aggtrade":
+            exchange_stage_label = "收盘边界→服务端聚合完成"
+            full_arrival_label = "收盘边界→本批最后聚合完成"
+            ingest_done_to_push_done_label = "全量本地聚合完成→全部客户端WS写出完成"
+            ingest_done_to_publish_start_label = "全量本地聚合完成→开始推送"
+            shard_arrival_label = "按 aggTrade 分片聚合完成"
+            round_arrival_label = "按推送轮次聚合完成"
+        else:
+            exchange_stage_label = "Binance到服务端"
+            full_arrival_label = "批次首事件到末入站耗时"
+            ingest_done_to_push_done_label = "末条入站→全部客户端WS写出完成"
+            ingest_done_to_publish_start_label = "末条入站→开始推送"
+            shard_arrival_label = "Binance到服务端（全市场一次性推送到齐）"
+            round_arrival_label = "Binance到服务端（一次性推送接收轮次）"
         body = (
             "【K线批次与ACK汇总】\n"
             f"推送模式：{'随到齐即一次性推送（多轮统计）' if self._klines_passthrough_mode else '服务端聚合后整批一次性下发'}\n"
+            f"数据源：{self._klines_source}\n"
+            f"REST验证：{self._format_rest_compare_summary(rest_compare_summary)}\n"
             f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
             f"收盘至推送完成（K线 close_time_ms → 本批最后一次 WebSocket 写出）：{ctp_line}\n"
+            f"周期边界→全部客户端WS写出完成：{pbp_line}\n"
+            f"{ingest_done_to_push_done_label}：{idp_line}\n"
+            f"{ingest_done_to_publish_start_label}：{ids_line}\n"
             f"（末次 push_done_ms={lpd_line}；close_time_ms 为 Binance 返回的当根 K 线最后一毫秒）\n"
             f"推送数量：{batch.get('batch_size', expected)}\n"
             f"期望总数：{batch.get('expected_symbols', expected)}\n"
@@ -1459,10 +1613,10 @@ class App:
             f"WS条数：{batch.get('ws_count', 0)}\n"
             f"REST条数：{batch.get('rest_count', 0)}\n"
             f"{push_stage_header}：{direct_push_stage_text}\n"
-            f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
-            f"批次首事件到末入站耗时：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
-            f"Binance到服务端（全市场一次性推送到齐）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
-            f"Binance到服务端（一次性推送接收轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
+            f"{exchange_stage_label}：{batch.get('binance_to_service', 'n=0')}\n"
+            f"{full_arrival_label}：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
+            f"{shard_arrival_label}：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
+            f"{round_arrival_label}：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
             f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
             f"服务端推送完成跨度（首轮 publish 至末轮 push_done）：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
             f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
@@ -1496,10 +1650,307 @@ class App:
             self._batch_order_ack_clients_by_close.pop(close_time_ms, None)
             self._batch_summary_by_close.pop(close_time_ms, None)
             self._batch_metric_values_by_close.pop(close_time_ms, None)
+            self._rest_compare_summary_by_close.pop(close_time_ms, None)
+            self._rest_compare_events_by_close.pop(close_time_ms, None)
             self._passthrough_shards_sent_by_close.pop(close_time_ms, None)
             self._passthrough_total_shards_by_close.pop(close_time_ms, None)
             self._batch_done_publish_ms_by_close.pop(close_time_ms, None)
             self._ack_notify_scheduled.discard(close_time_ms)
+
+    async def _notify_rest_compare_summary(self, summary: dict[str, int | float | str | bool]) -> None:
+        try:
+            close_time_ms = int(summary.get("close_time_ms") or 0)
+        except (TypeError, ValueError):
+            close_time_ms = 0
+        detail_path = ""
+        if close_time_ms > 0:
+            try:
+                detail_path = await asyncio.to_thread(self._write_rest_compare_detail_file, summary)
+                if detail_path:
+                    summary["mismatch_detail_file"] = detail_path
+            except Exception:
+                logger.exception("aggtrade.rest_compare.detail_write_failed close_time_ms=%s", close_time_ms)
+        body = self._format_rest_compare_notification_body(summary, close_time_ms, detail_path)
+        try:
+            await self._notifier.send("REST验证结果", body)
+        except Exception:
+            logger.exception("notify.rest_compare_summary_failed close_time_ms=%s", close_time_ms)
+        finally:
+            if close_time_ms > 0 and close_time_ms not in self._ack_expected_by_close:
+                self._rest_compare_summary_by_close.pop(close_time_ms, None)
+                self._rest_compare_events_by_close.pop(close_time_ms, None)
+
+    def _write_rest_compare_detail_file(self, summary: dict[str, int | float | str | bool]) -> str:
+        try:
+            close_time_ms = int(summary.get("close_time_ms") or 0)
+        except (TypeError, ValueError):
+            close_time_ms = 0
+        interval = str(summary.get("interval") or self._klines_interval or "kline")
+        safe_interval = "".join(ch if ch.isalnum() else "_" for ch in interval) or "kline"
+        if close_time_ms > 0:
+            stamp = datetime.fromtimestamp(close_time_ms / 1000).strftime("%Y%m%d_%H%M%S")
+        else:
+            stamp = str(int(time.time() * 1000))
+        logs_dir = Path("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        path = logs_dir / f"rest_compare_{safe_interval}_{stamp}_{close_time_ms}.txt"
+        lines = [
+            "REST验证结果明细",
+            f"数据源：{self._klines_source}",
+            f"周期：{interval}",
+            f"收盘时间：{self._format_close_time(close_time_ms)}",
+            f"close_time_ms：{close_time_ms}",
+            "",
+            "汇总",
+            self._format_rest_compare_summary_line(summary),
+            "",
+            self._format_rest_compare_bucket_table(str(summary.get("mismatch_error_buckets") or "-")),
+            "",
+            self._format_rest_compare_stats_table(str(summary.get("mismatch_error_stats") or "-")),
+            "",
+            "失败样本",
+            str(summary.get("mismatch_sample") or "-"),
+            "",
+            "REST错误样本",
+            str(summary.get("rest_error_sample") or "-"),
+            "",
+            "缺失/额外样本",
+            f"missing_agg={summary.get('missing_agg_sample', '-')}",
+            f"missing_rest={summary.get('missing_rest_sample', '-')}",
+            f"extra={summary.get('extra_sample', '-')}",
+            "",
+            "REST验证失败OHLCV/Q明细(agg->rest)",
+            str(summary.get("mismatch_detail_all") or "-"),
+            "",
+        ]
+        path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info(
+            "aggtrade.rest_compare.detail_written close_time_ms=%s path=%s",
+            close_time_ms,
+            path,
+        )
+        return str(path)
+
+    def _format_rest_compare_notification_body(
+        self,
+        summary: dict[str, int | float | str | bool],
+        close_time_ms: int,
+        detail_path: str,
+    ) -> str:
+        summary_text = (
+            self._format_rest_compare_summary(summary)
+            if bool(summary.get("skipped"))
+            else self._format_rest_compare_summary_line(summary)
+        )
+        lines = [
+            "【REST验证结果】",
+            f"数据源：{self._klines_source}",
+            f"收盘时间：{self._format_close_time(close_time_ms)}",
+            summary_text,
+        ]
+        if detail_path:
+            lines.append(f"明细文件：{detail_path}")
+        if not bool(summary.get("skipped")):
+            lines.extend(
+                [
+                    "",
+                    self._format_rest_compare_bucket_table(str(summary.get("mismatch_error_buckets") or "-")),
+                    "",
+                    self._format_rest_compare_stats_table(str(summary.get("mismatch_error_stats") or "-")),
+                ]
+            )
+        return "\n".join(lines)
+
+    async def _wait_for_rest_compare_summary(
+        self,
+        close_time_ms: int,
+    ) -> dict[str, int | float | str | bool] | None:
+        if self._klines_source != "aggtrade" or not self._cfg.websocket.aggtrade_compare_with_kline:
+            return None
+        existing = self._rest_compare_summary_by_close.get(close_time_ms)
+        if existing is not None:
+            return existing
+        event = self._rest_compare_events_by_close.setdefault(close_time_ms, asyncio.Event())
+        timeout_seconds = max(1.0, self._cfg.websocket.aggtrade_rest_compare_lark_timeout_seconds)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            logger.warning(
+                "aggtrade.rest_compare.lark_wait_timeout close_time_ms=%s timeout_seconds=%s",
+                close_time_ms,
+                timeout_seconds,
+            )
+            return None
+        return self._rest_compare_summary_by_close.get(close_time_ms)
+
+    def _format_rest_compare_summary_line(self, summary: dict[str, int | float | str | bool]) -> str:
+        status = "通过" if bool(summary.get("passed")) else "失败"
+        parts = [
+            status,
+            f"expected={summary.get('expected', 0)}",
+            f"rest={summary.get('rest_kline', 0)}",
+            f"agg={summary.get('aggtrade', 0)}",
+            f"matched={summary.get('matched', 0)}",
+            f"mismatch={summary.get('mismatched', 0)}",
+            f"missing_rest={summary.get('missing_rest', 0)}",
+            f"rest_errors={summary.get('rest_errors', 0)}",
+            f"delay={summary.get('validation_delay_seconds', 0)}s",
+            f"fetch={summary.get('validation_fetch_elapsed_ms', 0)}ms",
+        ]
+        return " ".join(parts)
+
+    def _format_rest_compare_bucket_table(self, buckets_text: str) -> str:
+        buckets = self._parse_rest_compare_buckets(buckets_text)
+        if not buckets:
+            return "误差分桶\n无误差"
+        lines = [
+            "误差分桶",
+            "| 字段 | ≤0.01% | ≤0.1% | ≤1% | >1% |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for label in self._ordered_rest_compare_labels(buckets):
+            counts = buckets[label]
+            lines.append(
+                f"| {self._rest_compare_field_label(label)} | {counts[0]} | {counts[1]} | {counts[2]} | {counts[3]} |"
+            )
+        return "\n".join(lines)
+
+    def _format_rest_compare_stats_table(self, stats_text: str) -> str:
+        stats = self._parse_rest_compare_stats(stats_text)
+        if not stats:
+            return "误差统计\n无误差"
+        lines = [
+            "误差统计",
+            "| 字段 | 数量 | 平均绝对误差 | 最大绝对误差 | 平均百分比 | P95百分比 | 最大百分比 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for label in self._ordered_rest_compare_labels(stats):
+            row = stats[label]
+            lines.append(
+                "| "
+                f"{self._rest_compare_field_label(label)} | "
+                f"{row.get('n', '0')} | "
+                f"{self._format_rest_compare_decimal(row.get('abs_avg', '0'))} | "
+                f"{self._format_rest_compare_decimal(row.get('abs_max', '0'))} | "
+                f"{self._format_rest_compare_percent(row.get('pct_avg', '0'))} | "
+                f"{self._format_rest_compare_percent(row.get('pct_p95', '0'))} | "
+                f"{self._format_rest_compare_percent(row.get('pct_max', '0'))} |"
+            )
+        return "\n".join(lines)
+
+    def _parse_rest_compare_buckets(self, text: str) -> dict[str, list[int]]:
+        if not text or text == "-":
+            return {}
+        result: dict[str, list[int]] = {}
+        bucket_indexes = {"<=0.01%": 0, "<=0.1%": 1, "<=1%": 2, ">1%": 3}
+        for segment in text.split("；"):
+            if ":" not in segment:
+                continue
+            label, raw_counts = segment.split(":", 1)
+            label = label.strip()
+            counts = [0, 0, 0, 0]
+            for token in raw_counts.split():
+                if "/" not in token:
+                    continue
+                bucket, value = token.rsplit("/", 1)
+                idx = bucket_indexes.get(bucket)
+                if idx is None:
+                    continue
+                try:
+                    counts[idx] = int(value)
+                except ValueError:
+                    counts[idx] = 0
+            if label and sum(counts) > 0:
+                result[label] = counts
+        return result
+
+    def _parse_rest_compare_stats(self, text: str) -> dict[str, dict[str, str]]:
+        if not text or text == "-":
+            return {}
+        result: dict[str, dict[str, str]] = {}
+        for segment in text.split("；"):
+            if ":" not in segment:
+                continue
+            label, raw_values = segment.split(":", 1)
+            values: dict[str, str] = {}
+            for token in raw_values.split():
+                if "=" not in token:
+                    continue
+                key, value = token.split("=", 1)
+                values[key] = value
+            label = label.strip()
+            if label and values:
+                result[label] = values
+        return result
+
+    def _ordered_rest_compare_labels(self, data: dict[str, object]) -> list[str]:
+        ordered = [label for label in ("O", "H", "L", "C", "V", "Q") if label in data]
+        ordered.extend(sorted(label for label in data if label not in {"O", "H", "L", "C", "V", "Q"}))
+        return ordered
+
+    def _rest_compare_field_label(self, label: str) -> str:
+        labels = {
+            "O": "开盘价 O",
+            "H": "最高价 H",
+            "L": "最低价 L",
+            "C": "收盘价 C",
+            "V": "成交量 V",
+            "Q": "成交额 Q",
+        }
+        return labels.get(label, label)
+
+    def _format_rest_compare_decimal(self, value: object, places: int = 6) -> str:
+        try:
+            decimal_value = Decimal(str(value).strip().rstrip("%"))
+            quant = Decimal(1).scaleb(-places)
+            text = format(decimal_value.quantize(quant), "f")
+        except Exception:
+            return str(value)
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
+
+    def _format_rest_compare_percent(self, value: object, places: int = 6) -> str:
+        try:
+            decimal_value = Decimal(str(value).strip().rstrip("%"))
+            quant = Decimal(1).scaleb(-places)
+            text = format(decimal_value.quantize(quant), "f")
+        except Exception:
+            text = str(value)
+            return text if text.endswith("%") else f"{text}%"
+        return f"{text}%"
+
+    def _format_rest_compare_summary(self, summary: dict[str, int | float | str | bool] | None) -> str:
+        if self._klines_source != "aggtrade":
+            return "n/a"
+        if not self._cfg.websocket.aggtrade_compare_with_kline:
+            return "已关闭"
+        if summary is None:
+            return "异步验证中/暂无结果"
+        if bool(summary.get("skipped")):
+            open_time_ms = summary.get("open_time_ms")
+            min_validate_open_time_ms = summary.get("min_validate_open_time_ms")
+            open_time_text = (
+                self._format_close_time(open_time_ms)
+                if isinstance(open_time_ms, int)
+                else str(open_time_ms or "n/a")
+            )
+            min_validate_text = (
+                self._format_close_time(min_validate_open_time_ms)
+                if isinstance(min_validate_open_time_ms, int)
+                else str(min_validate_open_time_ms or "n/a")
+            )
+            reason = str(summary.get("skip_reason") or "unknown")
+            return (
+                f"跳过 reason={reason} expected={summary.get('expected', 0)} "
+                f"agg={summary.get('aggtrade', 0)} "
+                f"本根open={open_time_text} 首个验证open>={min_validate_text}"
+            )
+        line = self._format_rest_compare_summary_line(summary)
+        detail_file = str(summary.get("mismatch_detail_file") or "")
+        if detail_file:
+            return f"{line} 明细文件={detail_file}"
+        return line
 
     def _format_stats(self, values: list[int]) -> str:
         if not values:
@@ -1566,7 +2017,7 @@ class App:
             ws_ago_ms = ws_activity.get(self._klines_interval)
             interval_shards = ws_shard_health.get(self._klines_interval, {})
             logger.info(
-                "service.heartbeat mode=%s ingest_1m=%s ingest_1h=%s pushed_alerts=%s pushed_1h=%s clients_alerts=%s clients_klines=%s klines_interval=%s ws_last_event_ago_ms=%s ws_stale_shards=%s ws_total_shards=%s ws_worst_shard_ago_ms=%s",
+                "service.heartbeat mode=%s ingest_1m=%s ingest_1h=%s pushed_alerts=%s pushed_1h=%s clients_alerts=%s clients_klines=%s klines_interval=%s klines_source=%s ws_last_event_ago_ms=%s ws_stale_shards=%s ws_total_shards=%s ws_worst_shard_ago_ms=%s",
                 self._cfg.service_mode,
                 self._ingest_1m,
                 self._ingest_1h,
@@ -1575,6 +2026,7 @@ class App:
                 alerts_clients,
                 klines_clients,
                 self._klines_interval,
+                self._klines_source,
                 ws_ago_ms,
                 interval_shards.get("stale_shards"),
                 interval_shards.get("total_shards"),

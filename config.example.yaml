@@ -8,6 +8,7 @@ binance:
   ws_base: wss://fstream.binance.com/stream
   rest_base: https://fapi.binance.com
   symbols_refresh_seconds: 1800
+  rest_proxy_url: null
   # WS 活性 watchdog：连续无实时数据达到阈值时，触发全部分片重建
   ws_watchdog_enabled: true
   ws_watchdog_no_data_periods: 2
@@ -48,6 +49,7 @@ alerts:
 webhook:
   enabled: false
   url: ""
+  proxy_url: null
   alerts_url: ""
 
 latency:
@@ -64,6 +66,25 @@ websocket:
   klines_port: 8766
   # 生产建议为 1h；压测/联调可临时改为 5m
   klines_interval: 1h
+  # K线批次固定使用 @aggTrade 本地聚合；不再开启 @kline_<interval> 的 x.k=true 长连接
+  klines_source: aggtrade
+  aggtrade_emit_grace_ms: 200
+  # 单个 symbol 的事件延迟不再触发 hold/reconnect；整条分片静默由 watchdog 处理
+  aggtrade_ws_max_event_lag_seconds: 0.0
+  # 已推送周期的 late trade 只跳过，不再打印逐条警告；字段保留兼容旧配置
+  aggtrade_late_trade_log_limit_per_close: 0
+  # 仅用于异步 REST K线对账，不会开启第二条 kline WebSocket；观测稳定几天后可改为 false
+  aggtrade_compare_with_kline: true
+  # 收盘后 10s 再启动 REST 对账；客户端推送不等待这个验证
+  aggtrade_rest_compare_delay_seconds: 10.0
+  aggtrade_rest_compare_concurrency: 8
+  # Lark 汇总最多等待 REST 对账结果 120s，超时则先发汇总
+  aggtrade_rest_compare_lark_timeout_seconds: 120.0
+  # aggTrade 实时流静默超过 30s 即重建分片，避免等到整个 K线周期后才发现断流
+  aggtrade_ws_watchdog_stale_seconds: 30
+  aggtrade_price_tolerance: "0"
+  aggtrade_volume_tolerance: "0.00000001"
+  aggtrade_quote_tolerance: "0.000001"
   # false：同一收盘时刻服务端聚齐后整批一次下发；true：分片到达即推（多轮）
   klines_passthrough_mode: false
   # 分片内凑齐超时则先推送该分片已有数据（毫秒）；仅 passthrough 模式使用
