@@ -1784,34 +1784,38 @@ class App:
             stamp = str(int(time.time() * 1000))
         logs_dir = Path("logs")
         logs_dir.mkdir(parents=True, exist_ok=True)
-        path = logs_dir / f"rest_compare_{safe_interval}_{stamp}_{close_time_ms}.txt"
+        path = logs_dir / f"rest_compare_{safe_interval}_{stamp}_{close_time_ms}.md"
         lines = [
-            "REST验证结果明细",
+            "# REST验证结果明细",
+            "",
             f"数据源：{self._klines_source}",
             f"周期：{interval}",
             f"收盘时间：{self._format_close_time(close_time_ms)}",
             f"close_time_ms：{close_time_ms}",
             "",
-            "汇总",
+            "## 汇总",
+            "",
             self._format_rest_compare_summary_line(summary),
             "",
             self._format_rest_compare_bucket_table(str(summary.get("mismatch_error_buckets") or "-")),
             "",
             self._format_rest_compare_stats_table(str(summary.get("mismatch_error_stats") or "-")),
             "",
-            "失败样本",
+            "## 失败样本",
+            "",
             str(summary.get("mismatch_sample") or "-"),
             "",
-            "REST错误样本",
+            "## REST错误样本",
+            "",
             str(summary.get("rest_error_sample") or "-"),
             "",
-            "缺失/额外样本",
+            "## 缺失/额外样本",
+            "",
             f"missing_agg={summary.get('missing_agg_sample', '-')}",
             f"missing_rest={summary.get('missing_rest_sample', '-')}",
             f"extra={summary.get('extra_sample', '-')}",
             "",
-            "REST验证失败OHLCV/Q明细(agg->rest)",
-            str(summary.get("mismatch_detail_all") or "-"),
+            self._format_rest_compare_detail_table(str(summary.get("mismatch_detail_all") or "-")),
             "",
         ]
         path.write_text("\n".join(lines), encoding="utf-8")
@@ -1928,6 +1932,77 @@ class App:
                 f"{self._format_rest_compare_percent(row.get('pct_max', '0'))} |"
             )
         return "\n".join(lines)
+
+    def _format_rest_compare_detail_table(self, detail_text: str) -> str:
+        rows = self._parse_rest_compare_details(detail_text)
+        if not rows:
+            return "## REST验证失败OHLCV/Q明细(agg->rest)\n\n无明细"
+        lines = [
+            "## REST验证失败OHLCV/Q明细(agg->rest)",
+            "",
+            "| Symbol | 字段 | Agg | REST | 绝对误差 | 百分比 |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for row in rows:
+            lines.append(
+                "| "
+                f"{self._markdown_cell(row['symbol'])} | "
+                f"{self._markdown_cell(self._rest_compare_field_label(row['label']))} | "
+                f"{self._format_rest_compare_decimal(row['agg'])} | "
+                f"{self._format_rest_compare_decimal(row['rest'])} | "
+                f"{self._format_rest_compare_decimal(row['abs'])} | "
+                f"{self._format_rest_compare_percent(row['pct'])} |"
+            )
+        return "\n".join(lines)
+
+    def _parse_rest_compare_details(self, text: str) -> list[dict[str, str]]:
+        if not text or text == "-":
+            return []
+        rows: list[dict[str, str]] = []
+        for segment in text.split("；"):
+            segment = segment.strip()
+            if not segment or "[" not in segment or not segment.endswith("]"):
+                continue
+            symbol, raw_fields = segment.split("[", 1)
+            symbol = symbol.strip()
+            raw_fields = raw_fields[:-1]
+            if not symbol:
+                continue
+            for raw_field in raw_fields.split(";"):
+                raw_field = raw_field.strip()
+                if not raw_field:
+                    continue
+                parsed = self._parse_rest_compare_detail_field(raw_field)
+                if parsed is None:
+                    continue
+                parsed["symbol"] = symbol
+                rows.append(parsed)
+        return rows
+
+    def _parse_rest_compare_detail_field(self, text: str) -> dict[str, str] | None:
+        parts = text.split()
+        if not parts or "=" not in parts[0] or "->" not in parts[0]:
+            return None
+        label, values = parts[0].split("=", 1)
+        agg, rest = values.split("->", 1)
+        row = {
+            "label": label.strip(),
+            "agg": agg.strip(),
+            "rest": rest.strip(),
+            "abs": "",
+            "pct": "",
+        }
+        for part in parts[1:]:
+            if part.startswith("abs="):
+                row["abs"] = part.split("=", 1)[1].strip()
+            elif part.startswith("pct="):
+                row["pct"] = part.split("=", 1)[1].strip()
+        if not row["label"] or not row["agg"] or not row["rest"] or not row["abs"] or not row["pct"]:
+            return None
+        return row
+
+    def _markdown_cell(self, value: object) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ").strip()
 
     def _parse_rest_compare_buckets(self, text: str) -> dict[str, list[int]]:
         if not text or text == "-":
