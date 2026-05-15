@@ -641,19 +641,33 @@ class App:
             first_ingest_ms = self._pending_first_ingest_ms.get(close_time_ms)
         if not missing_symbols:
             return
+        expected_symbols = len(self._expected_symbols)
+        publish_required = min_required
+        if self._max_missing_symbols > 0 and wait_ms >= self._full_batch_max_wait_ms:
+            tolerant_required = max(1, expected_symbols - self._max_missing_symbols)
+            publish_required = min(publish_required, tolerant_required)
 
         logger.warning(
-            "klines.batch.rest_repair.start close_time_ms=%s missing_symbols=%s wait_ms=%s repair_delay_ms=%s",
+            "klines.batch.rest_repair.start close_time_ms=%s missing_symbols=%s wait_ms=%s repair_delay_ms=%s publish_required=%s",
             close_time_ms,
             len(missing_symbols),
             wait_ms,
             self._rest_repair_delay_ms,
+            publish_required,
         )
 
         timeout_seconds = max(5.0, self._cfg.backfill.rest_timeout_seconds)
         repaired = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
             for symbol in missing_symbols:
+                async with self._pending_lock:
+                    rows_now = self._pending_by_close.get(close_time_ms)
+                    if not rows_now:
+                        return
+                    if len(rows_now) >= publish_required:
+                        break
+                    if symbol in rows_now:
+                        continue
                 try:
                     kline = await self._binance.fetch_exact_closed_kline_rest(
                         client,
@@ -672,6 +686,7 @@ class App:
                 if kline is None:
                     continue
                 self._ingest_1h += 1
+                got_after_repair = 0
                 async with self._pending_lock:
                     rows_now = self._pending_by_close.get(close_time_ms)
                     if rows_now is None or symbol in rows_now:
@@ -693,23 +708,27 @@ class App:
                         "service_region": self._cfg.service_region,
                         "source": "rest",
                     }
+                    got_after_repair = len(rows_now)
                 repaired += 1
+                if got_after_repair >= publish_required:
+                    break
 
         maybe_flush_rows: dict[str, dict] | None = None
         async with self._pending_lock:
             rows_now = self._pending_by_close.get(close_time_ms, {})
             got = len(rows_now)
-            if got >= min_required:
+            if got >= publish_required:
                 maybe_flush_rows = self._pending_by_close.pop(close_time_ms, {})
                 self._pending_has_ws.pop(close_time_ms, None)
                 first_ingest_ms = self._pending_first_ingest_ms.pop(close_time_ms, first_ingest_ms)
                 self._mark_close_time_published_locked(close_time_ms)
         logger.warning(
-            "klines.batch.rest_repair.done close_time_ms=%s repaired=%s got_symbols=%s min_required=%s",
+            "klines.batch.rest_repair.done close_time_ms=%s repaired=%s got_symbols=%s min_required=%s publish_required=%s",
             close_time_ms,
             repaired,
             len(maybe_flush_rows) if maybe_flush_rows is not None else got,
             min_required,
+            publish_required,
         )
         if maybe_flush_rows:
             await self._enqueue_publish(close_time_ms=close_time_ms, rows_by_symbol=maybe_flush_rows, first_ingest_ms=first_ingest_ms)
