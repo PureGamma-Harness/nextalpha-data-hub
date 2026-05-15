@@ -88,8 +88,8 @@ websocket:
   aggtrade_price_tolerance: "0"
   aggtrade_volume_tolerance: "0.00000001"
   aggtrade_quote_tolerance: "0.000001"
-  # 分片模式：每条WS连接承载约200个symbol
-  klines_ws_batch_size: 200
+  # 分片模式：每条WS连接承载约80个symbol
+  klines_ws_batch_size: 80
   # false：同一收盘时刻在服务端聚齐后整批一次下发（与生产一致）
   klines_passthrough_mode: false
   klines_replay_count: 3

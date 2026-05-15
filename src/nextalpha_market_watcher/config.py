@@ -85,7 +85,7 @@ class WebSocketPushConfig(BaseModel):
     # The legacy "kline" value is accepted for old configs, but App forces it off
     # so the Kline service does not open a second @kline_<interval> WebSocket.
     klines_source: KlinesSource = "aggtrade"
-    klines_ws_batch_size: int = 200
+    klines_ws_batch_size: int = 80
     # Only used when klines_source=aggtrade.
     aggtrade_emit_grace_ms: int = 200
     # Deprecated compatibility knob. Individual symbol event lag no longer holds
