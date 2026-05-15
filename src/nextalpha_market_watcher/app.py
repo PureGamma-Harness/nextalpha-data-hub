@@ -1609,118 +1609,58 @@ class App:
         await asyncio.sleep(max(1, delay_seconds))
         rest_compare_summary = self._rest_compare_summary_by_close.get(close_time_ms)
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
-        values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
-        ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(close_time_ms, [])
         batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(close_time_ms, [])
         batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(close_time_ms, [])
         batch_done_to_compute_ack_values = self._batch_done_to_compute_ack_by_close.get(close_time_ms, [])
         batch_done_to_order_ack_values = self._batch_done_to_order_ack_by_close.get(close_time_ms, [])
-        ack_clients = len(self._ack_clients_by_close.get(close_time_ms, set()))
         batch_ack_clients = len(self._batch_ack_clients_by_close.get(close_time_ms, set()))
         batch_integrated_ack_clients = len(self._batch_integrated_ack_clients_by_close.get(close_time_ms, set()))
         batch_compute_ack_clients = len(self._batch_compute_ack_clients_by_close.get(close_time_ms, set()))
         batch_order_ack_clients = len(self._batch_order_ack_clients_by_close.get(close_time_ms, set()))
         batch = self._batch_summary_by_close.get(close_time_ms, {})
         raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
-        round_sizes = raw_metrics.get("push_round_sizes", [])
-        round_no_ack = raw_metrics.get("push_round_no_ack_ms", [])
-        push_stage_header = "服务端一次性推送耗时（按推送轮次）"
-        round_ms_label = "单次推送耗时"
-        post_push_ack_label = "一次性推送全部完成后"
-        round_lines: list[str] = []
-        if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
-            total_rounds = min(len(round_sizes), len(round_no_ack))
-            for idx in range(total_rounds):
-                try:
-                    round_sz = int(round_sizes[idx])
-                    round_ms = int(round_no_ack[idx])
-                except (TypeError, ValueError):
-                    continue
-                round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
-        direct_push_stage_text = self._format_round_lines(round_lines)
-        ctp = batch.get("close_time_to_push_done_ms")
-        if isinstance(ctp, int):
-            ctp_line = f"{ctp:+d}ms"
-        elif ctp is None:
-            ctp_line = "n/a"
-        else:
-            ctp_line = str(ctp)
-        pbp = batch.get("period_boundary_to_push_done_ms")
-        if isinstance(pbp, int):
-            pbp_line = f"{pbp:+d}ms"
-        elif pbp is None:
-            pbp_line = "n/a"
-        else:
-            pbp_line = str(pbp)
-        idp = batch.get("ingest_done_to_push_done_ms")
-        if isinstance(idp, int):
-            idp_line = f"{idp}ms"
-        elif idp is None:
-            idp_line = "n/a"
-        else:
-            idp_line = str(idp)
-        ids = batch.get("ingest_done_to_publish_start_ms")
-        if isinstance(ids, int):
-            ids_line = f"{ids}ms"
-        elif ids is None:
-            ids_line = "n/a"
-        else:
-            ids_line = str(ids)
-        lpd = batch.get("last_batch_push_done_ms")
-        if isinstance(lpd, int):
-            lpd_line = str(lpd)
-        elif lpd is None:
-            lpd_line = "n/a"
-        else:
-            lpd_line = str(lpd)
-        if self._klines_source == "aggtrade":
-            exchange_stage_label = "收盘边界→服务端聚合完成"
-            full_arrival_label = "收盘边界→本批最后聚合完成"
-            ingest_done_to_push_done_label = "全量本地聚合完成→全部客户端WS写出完成"
-            ingest_done_to_publish_start_label = "全量本地聚合完成→开始推送"
-            shard_arrival_label = "按 aggTrade 分片聚合完成"
-            round_arrival_label = "按推送轮次聚合完成"
-        else:
-            exchange_stage_label = "Binance到服务端"
-            full_arrival_label = "批次首事件到末入站耗时"
-            ingest_done_to_push_done_label = "末条入站→全部客户端WS写出完成"
-            ingest_done_to_publish_start_label = "末条入站→开始推送"
-            shard_arrival_label = "Binance到服务端（全市场一次性推送到齐）"
-            round_arrival_label = "Binance到服务端（一次性推送接收轮次）"
-        body = (
-            "【K线批次与ACK汇总】\n"
-            f"推送模式：{'随到齐即一次性推送（多轮统计）' if self._klines_passthrough_mode else '服务端聚合后整批一次性下发'}\n"
-            f"数据源：{self._klines_source}\n"
-            f"REST验证：{self._format_rest_compare_summary(rest_compare_summary)}\n"
-            f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
-            f"收盘至推送完成（K线 close_time_ms → 本批最后一次 WebSocket 写出）：{ctp_line}\n"
-            f"周期边界→全部客户端WS写出完成：{pbp_line}\n"
-            f"{ingest_done_to_push_done_label}：{idp_line}\n"
-            f"{ingest_done_to_publish_start_label}：{ids_line}\n"
-            f"（末次 push_done_ms={lpd_line}；close_time_ms 为 Binance 返回的当根 K 线最后一毫秒）\n"
-            f"推送数量：{batch.get('batch_size', expected)}\n"
-            f"期望总数：{batch.get('expected_symbols', expected)}\n"
-            f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
-            f"WS条数：{batch.get('ws_count', 0)}\n"
-            f"REST条数：{batch.get('rest_count', 0)}\n"
-            f"{push_stage_header}：{direct_push_stage_text}\n"
-            f"{exchange_stage_label}：{batch.get('binance_to_service', 'n=0')}\n"
-            f"{full_arrival_label}：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
-            f"{shard_arrival_label}：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
-            f"{round_arrival_label}：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
-            f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
-            f"服务端推送完成跨度（首轮 publish 至末轮 push_done）：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
-            f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
-            f"延迟代币Top10：{batch.get('delayed_tokens_top10', 'n=0')}\n"
-            f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
-            f"批次ACK上报客户端数：{batch_ack_clients}\n"
-            f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
-            f"批次计算ACK上报客户端数：{batch_compute_ack_clients}\n"
-            f"批次下单ACK上报客户端数：{batch_order_ack_clients}\n"
-            f"{post_push_ack_label}批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
-            f"{post_push_ack_label}整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
-            f"{post_push_ack_label}计算ACK耗时：{self._format_stats(batch_done_to_compute_ack_values)}\n"
-            f"{post_push_ack_label}下单ACK耗时：{self._format_stats(batch_done_to_order_ack_values)}\n"
+        s2c_values = raw_metrics.get("s2c_no_ack_values", [])
+        s2c_text = (
+            self._format_stats_compact(s2c_values)
+            if isinstance(s2c_values, list)
+            else str(batch.get("service_to_client_no_ack", "n=0"))
+        )
+        mode_text = "多轮直推" if self._klines_passthrough_mode else "服务端整批"
+        count_text = (
+            f"{batch.get('batch_size', expected)}/{batch.get('expected_symbols', expected)}"
+            f" 缺失={batch.get('missing_symbols', 0)}"
+        )
+        ack_client_text = (
+            f"batch={batch_ack_clients} integrated={batch_integrated_ack_clients} "
+            f"compute={batch_compute_ack_clients} order={batch_order_ack_clients}"
+        )
+        ack_stats_parts: list[str] = []
+        for label, samples in (
+            ("batch", batch_done_to_ack_values),
+            ("integrated", batch_done_to_integrated_ack_values),
+            ("compute", batch_done_to_compute_ack_values),
+            ("order", batch_done_to_order_ack_values),
+        ):
+            if samples:
+                ack_stats_parts.append(f"{label}={self._format_stats_compact(samples)}")
+        ack_stats_text = "；".join(ack_stats_parts) if ack_stats_parts else "n=0"
+        local_done_label = "收盘边界→本地聚合完成" if self._klines_source == "aggtrade" else "首事件→末入站"
+        push_done_label = (
+            "本地聚合完成→WS写出完成" if self._klines_source == "aggtrade" else "末条入站→WS写出完成"
+        )
+        body = "\n".join(
+            [
+                "【K线批次与ACK汇总】",
+                f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}",
+                f"数据源/模式：{self._klines_source} / {mode_text}",
+                f"REST验证：{self._format_rest_compare_summary(rest_compare_summary)}",
+                f"推送：{count_text} 客户端={batch.get('connected_clients', 0)}",
+                f"收盘→WS写出完成：{self._format_ms_value(batch.get('close_time_to_push_done_ms'), signed=True)}；{push_done_label}：{self._format_ms_value(batch.get('ingest_done_to_push_done_ms'))}",
+                f"{local_done_label}：{self._format_ms_value(batch.get('binance_to_service_full_arrival_ms'))}；接收跨度：{self._format_ms_value(batch.get('service_ingest_spread_ms'))}",
+                f"服务端→客户端(不含ACK)：{s2c_text}",
+                f"ACK客户端：{ack_client_text}",
+                f"ACK耗时：{ack_stats_text}",
+            ]
         )
         try:
             await self._notifier.send("K线批次与ACK汇总", body)
@@ -2129,6 +2069,20 @@ class App:
             f"n={len(values_sorted)} 本次={current}ms "
             f"avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
         )
+
+    def _format_stats_compact(self, values: list[int]) -> str:
+        if not values:
+            return "n=0"
+        values_sorted = sorted(values)
+        p95 = self._percentile(values_sorted, 95.0)
+        return f"n={len(values_sorted)} 本次={values[-1]}ms p95={p95:.0f}ms max={values_sorted[-1]}ms"
+
+    def _format_ms_value(self, value: object, *, signed: bool = False) -> str:
+        if isinstance(value, int):
+            return f"{value:+d}ms" if signed else f"{value}ms"
+        if value is None:
+            return "n/a"
+        return str(value)
 
     def _format_round_lines(self, lines: list[str], head: int = 12, tail: int = 5) -> str:
         if not lines:
