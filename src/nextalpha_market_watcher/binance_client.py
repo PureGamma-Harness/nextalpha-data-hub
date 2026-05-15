@@ -385,11 +385,11 @@ class _AggTradeKlineComparator:
             return Decimal("0") if abs_error == 0 else Decimal("Infinity")
         return (abs_error / denominator) * Decimal("100")
 
-    async def request_rest_compare(self, close_time_ms: int, symbols: set[str]) -> None:
+    async def request_rest_compare(self, close_time_ms: int, symbols: set[str]) -> bool:
         if self._rest_compare_queue is None or close_time_ms in self._queued_rest_compare:
-            return
+            return False
         if close_time_ms in self._summary_done:
-            return
+            return False
         agg_bucket = self._agg_by_close.get(close_time_ms, {})
         target_symbols = {
             symbol
@@ -397,10 +397,10 @@ class _AggTradeKlineComparator:
             if symbol in self._expected_symbols and symbol in agg_bucket
         }
         if not target_symbols:
-            return
+            return False
         sample = next((agg_bucket.get(symbol) for symbol in sorted(target_symbols)), None)
         if sample is None:
-            return
+            return False
         if sample.open_time_ms < self._min_validate_open_time_ms:
             await self._skip_rest_compare(
                 close_time_ms,
@@ -408,7 +408,7 @@ class _AggTradeKlineComparator:
                 open_time_ms=sample.open_time_ms,
                 reason=self._min_validate_reason,
             )
-            return
+            return True
         self._target_symbols_by_close[close_time_ms] = target_symbols
         try:
             self._rest_compare_queue.put_nowait((close_time_ms, tuple(sorted(target_symbols))))
@@ -419,7 +419,7 @@ class _AggTradeKlineComparator:
                 close_time_ms,
                 len(self._queued_rest_compare),
             )
-            return
+            return False
         self._queued_rest_compare.add(close_time_ms)
         logger.info(
             "aggtrade.rest_compare.queued interval=%s close_time_ms=%s symbols=%s",
@@ -427,6 +427,7 @@ class _AggTradeKlineComparator:
             close_time_ms,
             len(target_symbols),
         )
+        return True
 
     async def _skip_rest_compare(
         self,
@@ -812,11 +813,11 @@ class BinanceClient:
         interval: str,
         close_time_ms: int,
         symbols: set[str],
-    ) -> None:
+    ) -> bool:
         comparator = self._aggtrade_comparators.get(interval)
         if comparator is None:
-            return
-        await comparator.request_rest_compare(close_time_ms, symbols)
+            return False
+        return await comparator.request_rest_compare(close_time_ms, symbols)
 
     def _build_ws_proxy_sock_socks5(
         self,

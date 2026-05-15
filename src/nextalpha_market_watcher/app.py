@@ -124,6 +124,8 @@ class App:
         # [expected_symbol_count, first_wall_ms, min_ingest_ms]
         self._passthrough_shard_meta: dict[tuple[int, str], list[int]] = {}
         self._passthrough_shard_max_wait_ms = max(50, self._cfg.websocket.klines_passthrough_shard_max_wait_ms)
+        self._pending_symbol_refresh: list[str] | None = None
+        self._symbol_refresh_apply_event = asyncio.Event()
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop_event = stop if stop is not None else asyncio.Event()
@@ -141,6 +143,7 @@ class App:
         passthrough_flush_task: asyncio.Task[None] | None = None
         publish_worker_task: asyncio.Task[None] | None = None
         latency_writer_task: asyncio.Task[None] | None = None
+        symbol_refresh_apply_task: asyncio.Task[bool] | None = None
         ws_tasks: list[asyncio.Task[None]] = []
         if self._alerts_ws is not None:
             ws_tasks.append(asyncio.create_task(self._alerts_ws.serve_until_stop(stop_event)))
@@ -154,6 +157,7 @@ class App:
             heartbeat_task = asyncio.create_task(self._run_heartbeat(stop_event))
             publish_worker_task = asyncio.create_task(self._run_publish_worker(stop_event))
             latency_writer_task = asyncio.create_task(self._run_latency_writer(stop_event))
+            symbol_refresh_apply_task = asyncio.create_task(self._symbol_refresh_apply_event.wait())
             if self._cfg.service_mode in ("klines", "all") and not self._klines_passthrough_mode:
                 stale_flush_task = asyncio.create_task(self._run_klines_stale_flush(stop_event))
             if self._cfg.service_mode in ("klines", "all") and self._klines_passthrough_mode:
@@ -162,6 +166,8 @@ class App:
 
             while True:
                 wait_set = {ingest_task, refresh_task, stop_wait}
+                if symbol_refresh_apply_task is not None:
+                    wait_set.add(symbol_refresh_apply_task)
                 done, _pending = await asyncio.wait(
                     wait_set,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -172,10 +178,14 @@ class App:
                         ingest_task.cancel()
                     if refresh_task and not refresh_task.done():
                         refresh_task.cancel()
+                    if symbol_refresh_apply_task and not symbol_refresh_apply_task.done():
+                        symbol_refresh_apply_task.cancel()
                     if ingest_task:
                         await asyncio.gather(ingest_task, return_exceptions=True)
                     if refresh_task:
                         await asyncio.gather(refresh_task, return_exceptions=True)
+                    if symbol_refresh_apply_task:
+                        await asyncio.gather(symbol_refresh_apply_task, return_exceptions=True)
                     if heartbeat_task:
                         await asyncio.gather(heartbeat_task, return_exceptions=True)
                     if stale_flush_task:
@@ -197,17 +207,43 @@ class App:
                         raise exc
                     break
 
-                if refresh_task in done:
-                    new_syms = await self._binance.fetch_symbols()
-                    if set(new_syms) != set(syms):
-                        logger.info("symbols.refresh %s->%s", len(syms), len(new_syms))
+                if symbol_refresh_apply_task in done:
+                    self._symbol_refresh_apply_event.clear()
+                    pending_symbols = self._pending_symbol_refresh
+                    self._pending_symbol_refresh = None
+                    symbol_refresh_apply_task = asyncio.create_task(self._symbol_refresh_apply_event.wait())
+                    if pending_symbols is not None and set(pending_symbols) != set(syms):
+                        logger.info(
+                            "symbols.refresh.apply current=%s new=%s",
+                            len(syms),
+                            len(pending_symbols),
+                        )
+                        syms = pending_symbols
                         if self._alerts is not None:
-                            self._alerts.prune_to_symbols(set(new_syms))
-                        syms = new_syms
+                            self._alerts.prune_to_symbols(set(syms))
                         if ingest_task and not ingest_task.done():
                             ingest_task.cancel()
                             await asyncio.gather(ingest_task, return_exceptions=True)
                         ingest_task = asyncio.create_task(self._run_ingestion(syms))
+                    continue
+
+                if refresh_task in done:
+                    new_syms = await self._binance.fetch_symbols()
+                    if set(new_syms) != set(syms):
+                        if self._should_defer_symbol_refresh_to_kline_batch():
+                            self._queue_symbol_refresh(syms, new_syms)
+                        else:
+                            logger.info("symbols.refresh.apply current=%s new=%s", len(syms), len(new_syms))
+                            if self._alerts is not None:
+                                self._alerts.prune_to_symbols(set(new_syms))
+                            syms = new_syms
+                            if ingest_task and not ingest_task.done():
+                                ingest_task.cancel()
+                                await asyncio.gather(ingest_task, return_exceptions=True)
+                            ingest_task = asyncio.create_task(self._run_ingestion(syms))
+                    else:
+                        self._pending_symbol_refresh = None
+                        self._symbol_refresh_apply_event.clear()
                     refresh_task = asyncio.create_task(
                         asyncio.sleep(self._cfg.binance.symbols_refresh_seconds),
                     )
@@ -222,6 +258,7 @@ class App:
                 passthrough_flush_task,
                 publish_worker_task,
                 latency_writer_task,
+                symbol_refresh_apply_task,
                 *ws_tasks,
             ]
             for t in to_cancel:
@@ -232,6 +269,56 @@ class App:
                 return_exceptions=True,
             )
             await self._latency_redis.aclose()
+
+    def _should_defer_symbol_refresh_to_kline_batch(self) -> bool:
+        return self._cfg.service_mode in ("klines", "all") and self._klines_ws is not None
+
+    def _queue_symbol_refresh(self, current_symbols: list[str], new_symbols: list[str]) -> None:
+        current_set = set(current_symbols)
+        new_set = set(new_symbols)
+        added = sorted(new_set - current_set)
+        removed = sorted(current_set - new_set)
+        self._pending_symbol_refresh = list(new_symbols)
+        logger.info(
+            "symbols.refresh.detected current=%s new=%s added=%s removed=%s added_sample=%s removed_sample=%s apply=after_kline_batch",
+            len(current_symbols),
+            len(new_symbols),
+            len(added),
+            len(removed),
+            ",".join(added[:20]) if added else "-",
+            ",".join(removed[:20]) if removed else "-",
+        )
+
+    async def _maybe_signal_symbol_refresh_after_batch(self, close_time_ms: int) -> None:
+        if self._pending_symbol_refresh is None or self._symbol_refresh_apply_event.is_set():
+            return
+        rest_event = self._rest_compare_events_by_close.get(close_time_ms)
+        if rest_event is not None and not rest_event.is_set():
+            wait_seconds = self._symbol_refresh_rest_compare_wait_seconds()
+            logger.info(
+                "symbols.refresh.wait_rest_compare close_time_ms=%s timeout_seconds=%.1f",
+                close_time_ms,
+                wait_seconds,
+            )
+            try:
+                await asyncio.wait_for(rest_event.wait(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "symbols.refresh.rest_compare_wait_timeout close_time_ms=%s timeout_seconds=%.1f",
+                    close_time_ms,
+                    wait_seconds,
+                )
+        logger.info(
+            "symbols.refresh.ready close_time_ms=%s pending=%s",
+            close_time_ms,
+            len(self._pending_symbol_refresh),
+        )
+        self._symbol_refresh_apply_event.set()
+
+    def _symbol_refresh_rest_compare_wait_seconds(self) -> float:
+        compare_delay = max(0.0, self._cfg.websocket.aggtrade_rest_compare_delay_seconds)
+        rest_timeout = max(1.0, float(self._cfg.backfill.rest_timeout_seconds))
+        return max(60.0, compare_delay + rest_timeout * 4.0)
 
     async def _run_ingestion(self, symbols: list[str]) -> None:
         tasks: list[asyncio.Task[None]] = []
@@ -497,11 +584,13 @@ class App:
             compare_symbols.discard("")
             if compare_symbols:
                 try:
-                    await self._binance.request_aggtrade_rest_compare(
+                    compare_queued = await self._binance.request_aggtrade_rest_compare(
                         self._klines_interval,
                         close_time_ms,
                         compare_symbols,
                     )
+                    if compare_queued:
+                        self._rest_compare_events_by_close.setdefault(close_time_ms, asyncio.Event())
                 except Exception:
                     logger.exception("aggtrade.rest_compare.request_failed close_time_ms=%s", close_time_ms)
         if self._klines_source == "aggtrade":
@@ -605,6 +694,8 @@ class App:
             publish_ms,
             push_done_ms,
         )
+        if batch_done:
+            await self._maybe_signal_symbol_refresh_after_batch(close_time_ms)
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
