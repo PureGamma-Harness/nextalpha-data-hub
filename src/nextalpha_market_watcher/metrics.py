@@ -31,6 +31,11 @@ WS_CONNECTIONS = Counter(
     "WebSocket connections opened",
     ("interval",),
 )
+WS_KLINE_FAST_SKIPPED = Counter(
+    "watcher_ws_kline_fast_skipped_total",
+    "WebSocket kline frames skipped before JSON decoding because they are not closed klines",
+    ("interval",),
+)
 BACKFILL_KLINES = Counter(
     "watcher_backfill_klines_total",
     "Klines loaded via REST backfill",

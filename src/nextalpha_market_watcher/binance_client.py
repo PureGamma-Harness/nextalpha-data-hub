@@ -24,12 +24,41 @@ from .metrics import (
     BACKFILL_KLINES,
     EXCHANGE_TO_SERVICE_MS,
     KLINES_RECEIVED,
+    WS_KLINE_FAST_SKIPPED,
     WS_CONNECTIONS,
     touch_ingest,
 )
 from .models import ClosedKline
 
 logger = logging.getLogger(__name__)
+
+_JSON_WHITESPACE = b" \t\r\n"
+_CLOSED_KLINE_KEY = b'"x"'
+_CONTROL_FRAME_MARKERS = (b'"code"', b'"msg"', b'"result"', b'"id"')
+
+
+def _raw_has_closed_kline_marker(raw: bytes) -> bool:
+    """Return True when a raw Binance frame contains the kline close flag x=true."""
+    start = 0
+    while True:
+        idx = raw.find(_CLOSED_KLINE_KEY, start)
+        if idx < 0:
+            return False
+        pos = idx + len(_CLOSED_KLINE_KEY)
+        while pos < len(raw) and raw[pos] in _JSON_WHITESPACE:
+            pos += 1
+        if pos < len(raw) and raw[pos] == ord(":"):
+            pos += 1
+            while pos < len(raw) and raw[pos] in _JSON_WHITESPACE:
+                pos += 1
+            if raw.startswith(b"true", pos):
+                return True
+        start = idx + len(_CLOSED_KLINE_KEY)
+
+
+def _raw_maybe_control_frame(raw: bytes) -> bool:
+    return any(marker in raw for marker in _CONTROL_FRAME_MARKERS)
+
 
 def _no_proxy_matches_host(host: str, no_proxy: str) -> bool:
     host = host.lower().strip(".")
@@ -454,6 +483,7 @@ class BinanceClient:
         total_shards: int,
     ) -> None:
         stream_names = [f"{s.lower()}@kline_{interval}" for s in symbols]
+        fast_skipped_metric = WS_KLINE_FAST_SKIPPED.labels(interval)
         ws_base = self._cfg.binance.ws_base.split("?", 1)[0].rstrip("/")
         if ws_base.endswith("/stream"):
             stream_base = ws_base
@@ -523,6 +553,22 @@ class BinanceClient:
                             self._ws_watchdog_alerted[interval] = False
                             shard_alerted = self._ws_shard_watchdog_alerted.setdefault(interval, {})
                             shard_alerted[shard_id] = False
+                            if not _raw_has_closed_kline_marker(raw) and not _raw_maybe_control_frame(raw):
+                                fast_skipped_metric.inc()
+                                debug_key = f"{interval}:{shard_id}:fast_skip"
+                                if debug_key not in self._ws_parse_debug_logged:
+                                    self._ws_parse_debug_logged.add(debug_key)
+                                    try:
+                                        raw_sample = raw[:200].decode("utf-8", errors="ignore")
+                                    except Exception:
+                                        raw_sample = "<unprintable>"
+                                    logger.info(
+                                        "ws.kline_fast_skip_debug interval=%s shard=%s raw_sample=%s",
+                                        interval,
+                                        shard_id,
+                                        raw_sample,
+                                    )
+                                continue
                             payload = orjson.loads(raw)
                             if "code" in payload or "msg" in payload:
                                 logger.error(

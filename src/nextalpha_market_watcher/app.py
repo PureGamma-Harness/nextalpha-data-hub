@@ -1344,7 +1344,7 @@ class App:
                     continue
                 round_b2s_lines.append(f"第{idx + 1}次：symbols={round_sz} 到达耗时={round_ms}ms")
             if round_b2s_lines:
-                round_b2s_text = "；".join(round_b2s_lines)
+                round_b2s_text = self._format_round_lines(round_b2s_lines)
         delayed_top_text = "n=0"
         if isinstance(cast_delayed_tokens, list) and cast_delayed_tokens:
             delayed_sorted = sorted(
@@ -1413,7 +1413,7 @@ class App:
                 except (TypeError, ValueError):
                     continue
                 round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
-        direct_push_stage_text = "；".join(round_lines) if round_lines else "n=0"
+        direct_push_stage_text = self._format_round_lines(round_lines)
         ctp = batch.get("close_time_to_push_done_ms")
         if isinstance(ctp, int):
             ctp_line = f"{ctp:+d}ms"
@@ -1493,6 +1493,16 @@ class App:
             f"n={len(values_sorted)} 本次={current}ms "
             f"avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
         )
+
+    def _format_round_lines(self, lines: list[str], head: int = 12, tail: int = 5) -> str:
+        if not lines:
+            return "n=0"
+        head = max(1, head)
+        tail = max(0, tail)
+        if len(lines) <= head + tail:
+            return "；".join(lines)
+        omitted = len(lines) - head - tail
+        return "；".join([*lines[:head], f"... 省略{omitted}轮 ...", *lines[-tail:]])
 
     def _format_close_time(self, close_time_ms: object) -> str:
         try:
