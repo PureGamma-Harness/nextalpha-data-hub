@@ -60,7 +60,7 @@ websocket:
   host: 0.0.0.0
   alerts_port: 8765
   klines_port: 8766
-  klines_interval: 1h
+  klines_interval: 5m
   # K线批次固定使用 @aggTrade 本地聚合；不再开启 @kline_<interval> 的 x.k=true 长连接
   klines_source: aggtrade
   aggtrade_emit_grace_ms: 200
