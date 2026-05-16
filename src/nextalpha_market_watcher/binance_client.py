@@ -1130,7 +1130,7 @@ class BinanceClient:
         interval: str,
         batch_size: int = 200,
         *,
-        emit_grace_ms: int = 50,
+        emit_grace_ms: int | None = None,
         compare_with_rest_kline: bool = True,
         rest_compare_delay_seconds: float = 2.0,
         rest_compare_concurrency: int = 8,
@@ -1142,6 +1142,8 @@ class BinanceClient:
         interval_ms = self._interval_to_ms(interval)
         if interval_ms <= 0:
             raise ValueError(f"Unsupported kline interval for aggTrade aggregation: {interval!r}")
+        if emit_grace_ms is None:
+            emit_grace_ms = self._cfg.websocket.aggtrade_emit_grace_ms
 
         symbol_batches = self._build_stream_symbol_batches(
             symbols,

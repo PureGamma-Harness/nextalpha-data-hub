@@ -1,2 +1,0 @@
-# 请使用仓库根目录的 docker-compose.yml（与 config.docker.yaml 配套）。
-# 在仓库根目录执行: docker compose up -d --build

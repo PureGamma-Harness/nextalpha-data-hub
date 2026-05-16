@@ -71,7 +71,7 @@ websocket:
   klines_interval: 5m
   # K线批次固定使用 @aggTrade 本地聚合；不再开启 @kline_<interval> 的 x.k=true 长连接
   klines_source: aggtrade
-  aggtrade_emit_grace_ms: 200
+  aggtrade_emit_grace_ms: 800
   # 单个 symbol 的事件延迟不再触发 hold/reconnect；整条分片静默由 watchdog 处理
   aggtrade_ws_max_event_lag_seconds: 0.0
   # 已推送周期的 late trade 只跳过，不再打印逐条警告；字段保留兼容旧配置

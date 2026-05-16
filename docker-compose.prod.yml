@@ -2,7 +2,7 @@ services:
   market-watcher-alerts:
     build:
       context: .
-      dockerfile: deploy/docker/Dockerfile
+      dockerfile: Dockerfile
     container_name: nextalpha-market-watcher-alerts
     restart: unless-stopped
     command:
@@ -28,7 +28,7 @@ services:
   market-watcher-klines:
     build:
       context: .
-      dockerfile: deploy/docker/Dockerfile
+      dockerfile: Dockerfile
     container_name: nextalpha-market-watcher-klines
     restart: unless-stopped
     command:

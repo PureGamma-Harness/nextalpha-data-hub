@@ -87,7 +87,7 @@ class WebSocketPushConfig(BaseModel):
     klines_source: KlinesSource = "aggtrade"
     klines_ws_batch_size: int = 80
     # Only used when klines_source=aggtrade.
-    aggtrade_emit_grace_ms: int = 200
+    aggtrade_emit_grace_ms: int = 800
     # Deprecated compatibility knob. Individual symbol event lag no longer holds
     # emission or triggers reconnect; shard-level no-data watchdog handles broken WSS.
     aggtrade_ws_max_event_lag_seconds: float = 0.0
