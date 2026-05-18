@@ -77,7 +77,7 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 - **K 线链路**（`market-watcher-klines`）：
   - 消费配置周期（当前联调常用 `5m`，生产可切 `1h`）的已收盘 K 线；
   - 数据源固定为 Binance `@aggTrade` 本地聚合 OHLCV；K线批次服务不再开启 `@kline_<interval>` / `k.x=true` 长连接，避免与 aggTrade 聚合链路争抢 CPU；
-  - 可保留异步 REST K线对账（`websocket.aggtrade_compare_with_kline: true`）：客户端推送不等待验证；REST 对账默认在收盘后 10s 启动；Lark 批次汇总会等待对账结果后再发，超时则先发汇总；
+  - 可保留异步 REST K线对账（`websocket.aggtrade_compare_with_kline: true`）：客户端推送不等待验证；默认在收盘后 800/1800/3000/5000ms 各抽样 50 个 symbol 做本地 aggTrade 快照与 REST 快照诊断，并在收盘后 10s 做全量 REST 验证；
   - 前几天观测稳定且 REST 验证持续通过后，可将 `websocket.aggtrade_compare_with_kline` 改为 `false`，后续只保留 aggTrade 本地聚合，停止消耗 REST request weight；
   - 按 `close_time_ms` 做“全市场同一收盘时刻批次聚合”；生产默认 `websocket.klines_passthrough_mode: false`，服务端聚齐（或达放行策略）后**整批一次**下发；若改为 `true` 则为分片凑齐或超时后**多轮**直推。
   - 推送到 `ws://<host>:8766/ws/klines`（单条消息为 `list[dict]` 批量）。
@@ -136,7 +136,9 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
   - 收盘时间、数据源/模式、推送数量/期望总数/缺失数量、客户端连接数；
   - 服务端链路：收盘边界到本地聚合完成、本地聚合完成到 WebSocket 写出完成、收盘到 WebSocket 写出完成；
   - 固定展示客户端接收 ACK、计算 ACK、下单 ACK 耗时；没有客户端或没有阶段 ACK 时显示 `n=0`；
-  - REST 验证结果不再混在批次通知里，单独发送 `REST验证结果` 并写入 `logs/rest_compare_*.md`。
+  - REST 验证结果不再混在批次通知里，单独发送 `REST验证结果` 并写入 `logs/rest_compare_*.md`；
+  - `REST验证结果` 按 `800ms/1800ms/3000ms/5000ms/10000ms` 分段展示；前四段是抽样诊断，`10000ms` 是全量验证；
+  - REST 通知同时展示 exact mismatch 与业务口径：价格字段任一不一致计入 `price_mismatch_symbols`，成交量/成交额误差超过 1% 计入 `vq_gt_1pct_symbols`。
 - **告警通知**包含：
   - 币种、周期、方向、上一根K线收盘价、当前对比K线收盘价、涨跌幅、触发阈值、告警客户端连接数。
 

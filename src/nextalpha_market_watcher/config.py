@@ -100,6 +100,9 @@ class WebSocketPushConfig(BaseModel):
     aggtrade_rest_compare_delay_seconds: float = 10.0
     aggtrade_rest_compare_concurrency: int = 8
     aggtrade_rest_compare_lark_timeout_seconds: float = 120.0
+    aggtrade_rest_diagnostic_enabled: bool = True
+    aggtrade_rest_diagnostic_sample_size: int = 50
+    aggtrade_rest_diagnostic_offsets_ms: list[int] = Field(default_factory=lambda: [800, 1800, 3000, 5000])
     # aggTrade is a live trade stream; it should not be silent for whole kline periods.
     aggtrade_ws_watchdog_stale_seconds: int = 30
     aggtrade_price_tolerance: str = "0"

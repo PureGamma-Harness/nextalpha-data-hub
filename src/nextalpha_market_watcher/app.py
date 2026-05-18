@@ -112,7 +112,8 @@ class App:
         self._ack_notify_scheduled: set[int] = set()
         self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
         self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
-        self._rest_compare_summary_by_close: dict[int, dict[str, int | float | str | bool]] = {}
+        self._rest_compare_summary_by_close: dict[int, dict[str, object]] = {}
+        self._rest_compare_snapshots_by_close: dict[int, dict[str, dict[str, object]]] = {}
         self._rest_compare_events_by_close: dict[int, asyncio.Event] = {}
         self._passthrough_shards_sent_by_close: dict[int, set[str]] = {}
         self._passthrough_total_shards_by_close: dict[int, int] = {}
@@ -427,6 +428,15 @@ class App:
                 1,
                 self._cfg.websocket.aggtrade_rest_compare_concurrency,
             ),
+            rest_diagnostic_enabled=self._cfg.websocket.aggtrade_rest_diagnostic_enabled,
+            rest_diagnostic_sample_size=max(
+                1,
+                self._cfg.websocket.aggtrade_rest_diagnostic_sample_size,
+            ),
+            rest_diagnostic_offsets_ms=tuple(
+                max(0, int(offset_ms))
+                for offset_ms in self._cfg.websocket.aggtrade_rest_diagnostic_offsets_ms
+            ),
             price_tolerance=self._decimal_config(
                 self._cfg.websocket.aggtrade_price_tolerance,
                 Decimal("0"),
@@ -442,13 +452,27 @@ class App:
             rest_compare_summary_callback=self._on_aggtrade_rest_compare_summary,
         )
 
-    async def _on_aggtrade_rest_compare_summary(self, summary: dict[str, int | float | str | bool]) -> None:
+    async def _on_aggtrade_rest_compare_summary(self, summary: dict[str, object]) -> None:
         try:
             close_time_ms = int(summary.get("close_time_ms") or 0)
         except (TypeError, ValueError):
             return
         if close_time_ms <= 0:
             return
+        snapshot_label = str(summary.get("snapshot_label") or "")
+        if snapshot_label:
+            snapshots = self._rest_compare_snapshots_by_close.setdefault(close_time_ms, {})
+            snapshots[snapshot_label] = summary
+            if not bool(summary.get("diagnostic_final")):
+                return
+            summary = dict(summary)
+            summary["snapshot_summaries"] = tuple(
+                snapshots[label]
+                for label in sorted(
+                    snapshots,
+                    key=lambda item: int(snapshots[item].get("snapshot_offset_ms") or 0),
+                )
+            )
         self._rest_compare_summary_by_close[close_time_ms] = summary
         event = self._rest_compare_events_by_close.setdefault(close_time_ms, asyncio.Event())
         event.set()
@@ -1680,13 +1704,14 @@ class App:
             self._batch_summary_by_close.pop(close_time_ms, None)
             self._batch_metric_values_by_close.pop(close_time_ms, None)
             self._rest_compare_summary_by_close.pop(close_time_ms, None)
+            self._rest_compare_snapshots_by_close.pop(close_time_ms, None)
             self._rest_compare_events_by_close.pop(close_time_ms, None)
             self._passthrough_shards_sent_by_close.pop(close_time_ms, None)
             self._passthrough_total_shards_by_close.pop(close_time_ms, None)
             self._batch_done_publish_ms_by_close.pop(close_time_ms, None)
             self._ack_notify_scheduled.discard(close_time_ms)
 
-    async def _notify_rest_compare_summary(self, summary: dict[str, int | float | str | bool]) -> None:
+    async def _notify_rest_compare_summary(self, summary: dict[str, object]) -> None:
         try:
             close_time_ms = int(summary.get("close_time_ms") or 0)
         except (TypeError, ValueError):
@@ -1707,9 +1732,10 @@ class App:
         finally:
             if close_time_ms > 0 and close_time_ms not in self._ack_expected_by_close:
                 self._rest_compare_summary_by_close.pop(close_time_ms, None)
+                self._rest_compare_snapshots_by_close.pop(close_time_ms, None)
                 self._rest_compare_events_by_close.pop(close_time_ms, None)
 
-    def _write_rest_compare_detail_file(self, summary: dict[str, int | float | str | bool]) -> str:
+    def _write_rest_compare_detail_file(self, summary: dict[str, object]) -> str:
         try:
             close_time_ms = int(summary.get("close_time_ms") or 0)
         except (TypeError, ValueError):
@@ -1723,39 +1749,23 @@ class App:
         logs_dir = Path("logs")
         logs_dir.mkdir(parents=True, exist_ok=True)
         path = logs_dir / f"rest_compare_{safe_interval}_{stamp}_{close_time_ms}.md"
-        lines = [
+        snapshots = self._rest_compare_snapshot_summaries(summary)
+        multiple_snapshots = len(snapshots) > 1
+        lines: list[str] = [
             "# REST验证结果明细",
             "",
             f"数据源：{self._klines_source}",
             f"周期：{interval}",
             f"收盘时间：{self._format_close_time(close_time_ms)}",
             f"close_time_ms：{close_time_ms}",
-            "",
-            "## 汇总",
-            "",
-            self._format_rest_compare_summary_line(summary),
-            "",
-            self._format_rest_compare_bucket_table(str(summary.get("mismatch_error_buckets") or "-")),
-            "",
-            self._format_rest_compare_stats_table(str(summary.get("mismatch_error_stats") or "-")),
-            "",
-            "## 失败样本",
-            "",
-            str(summary.get("mismatch_sample") or "-"),
-            "",
-            "## REST错误样本",
-            "",
-            str(summary.get("rest_error_sample") or "-"),
-            "",
-            "## 缺失/额外样本",
-            "",
-            f"missing_agg={summary.get('missing_agg_sample', '-')}",
-            f"missing_rest={summary.get('missing_rest_sample', '-')}",
-            f"extra={summary.get('extra_sample', '-')}",
-            "",
-            self._format_rest_compare_detail_table(str(summary.get("mismatch_detail_all") or "-")),
-            "",
         ]
+        for item in snapshots:
+            if multiple_snapshots:
+                lines.extend(["", f"## {self._format_rest_compare_snapshot_title(item)}", ""])
+                lines.extend(self._format_rest_compare_detail_section(item, heading_level=3))
+            else:
+                lines.extend([""])
+                lines.extend(self._format_rest_compare_detail_section(item, heading_level=2))
         path.write_text("\n".join(lines), encoding="utf-8")
         logger.info(
             "aggtrade.rest_compare.detail_written close_time_ms=%s path=%s",
@@ -1766,7 +1776,19 @@ class App:
 
     def _format_rest_compare_notification_body(
         self,
-        summary: dict[str, int | float | str | bool],
+        summary: dict[str, object],
+        close_time_ms: int,
+        detail_path: str,
+    ) -> str:
+        blocks = [
+            self._format_rest_compare_notification_block(item, close_time_ms, detail_path)
+            for item in self._rest_compare_snapshot_summaries(summary)
+        ]
+        return "\n\n".join(block for block in blocks if block)
+
+    def _format_rest_compare_notification_block(
+        self,
+        summary: dict[str, object],
         close_time_ms: int,
         detail_path: str,
     ) -> str:
@@ -1776,11 +1798,14 @@ class App:
             else self._format_rest_compare_summary_line(summary)
         )
         lines = [
-            "【REST验证结果】",
+            f"【{self._format_rest_compare_snapshot_title(summary)}】",
             f"数据源：{self._klines_source}",
             f"收盘时间：{self._format_close_time(close_time_ms)}",
             summary_text,
         ]
+        business_line = self._format_rest_compare_business_line(summary)
+        if business_line:
+            lines.append(business_line)
         if detail_path:
             lines.append(f"明细文件：{detail_path}")
         if not bool(summary.get("skipped")):
@@ -1794,10 +1819,99 @@ class App:
             )
         return "\n".join(lines)
 
+    def _rest_compare_snapshot_summaries(self, summary: dict[str, object]) -> list[dict[str, object]]:
+        raw_snapshots = summary.get("snapshot_summaries")
+        if isinstance(raw_snapshots, (list, tuple)):
+            snapshots = [item for item in raw_snapshots if isinstance(item, dict)]
+            if snapshots:
+                return sorted(snapshots, key=self._rest_compare_snapshot_sort_key)
+        return [summary]
+
+    def _rest_compare_snapshot_sort_key(self, summary: dict[str, object]) -> int:
+        try:
+            return int(summary.get("snapshot_offset_ms") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _format_rest_compare_snapshot_title(self, summary: dict[str, object]) -> str:
+        label = str(summary.get("snapshot_label") or "").strip()
+        if label:
+            return f"REST验证结果{label}"
+        return "REST验证结果"
+
+    def _format_rest_compare_business_line(self, summary: dict[str, object]) -> str:
+        has_business_fields = (
+            "price_mismatch_symbols" in summary
+            or "vq_gt_1pct_symbols" in summary
+            or "business_passed" in summary
+        )
+        if not has_business_fields:
+            return ""
+        scope = "抽样" if bool(summary.get("diagnostic_sample")) else "全量"
+        if bool(summary.get("diagnostic_sample")) and summary.get("sample_size"):
+            scope = f"{scope}{summary.get('sample_size')}"
+        status = "通过" if bool(summary.get("business_passed")) else "关注"
+        return (
+            f"业务口径({scope})：{status} "
+            f"price_mismatch_symbols={summary.get('price_mismatch_symbols', 0)} "
+            f"vq_gt_1pct_symbols={summary.get('vq_gt_1pct_symbols', 0)}"
+        )
+
+    def _format_rest_compare_detail_section(
+        self,
+        summary: dict[str, object],
+        *,
+        heading_level: int,
+    ) -> list[str]:
+        heading = "#" * max(1, heading_level)
+        lines = [
+            f"{heading} 汇总",
+            "",
+            (
+                self._format_rest_compare_summary(summary)
+                if bool(summary.get("skipped"))
+                else self._format_rest_compare_summary_line(summary)
+            ),
+        ]
+        business_line = self._format_rest_compare_business_line(summary)
+        if business_line:
+            lines.append(business_line)
+        if bool(summary.get("skipped")):
+            return lines + [""]
+        lines.extend(
+            [
+                "",
+                self._format_rest_compare_bucket_table(str(summary.get("mismatch_error_buckets") or "-")),
+                "",
+                self._format_rest_compare_stats_table(str(summary.get("mismatch_error_stats") or "-")),
+                "",
+                f"{heading} 失败样本",
+                "",
+                str(summary.get("mismatch_sample") or "-"),
+                "",
+                f"{heading} REST错误样本",
+                "",
+                str(summary.get("rest_error_sample") or "-"),
+                "",
+                f"{heading} 缺失/额外样本",
+                "",
+                f"missing_agg={summary.get('missing_agg_sample', '-')}",
+                f"missing_rest={summary.get('missing_rest_sample', '-')}",
+                f"extra={summary.get('extra_sample', '-')}",
+                "",
+                self._format_rest_compare_detail_table(
+                    str(summary.get("mismatch_detail_all") or "-"),
+                    heading_level=heading_level,
+                ),
+                "",
+            ]
+        )
+        return lines
+
     async def _wait_for_rest_compare_summary(
         self,
         close_time_ms: int,
-    ) -> dict[str, int | float | str | bool] | None:
+    ) -> dict[str, object] | None:
         if self._klines_source != "aggtrade" or not self._cfg.websocket.aggtrade_compare_with_kline:
             return None
         existing = self._rest_compare_summary_by_close.get(close_time_ms)
@@ -1816,7 +1930,7 @@ class App:
             return None
         return self._rest_compare_summary_by_close.get(close_time_ms)
 
-    def _format_rest_compare_summary_line(self, summary: dict[str, int | float | str | bool]) -> str:
+    def _format_rest_compare_summary_line(self, summary: dict[str, object]) -> str:
         status = "通过" if bool(summary.get("passed")) else "失败"
         parts = [
             status,
@@ -1871,12 +1985,13 @@ class App:
             )
         return "\n".join(lines)
 
-    def _format_rest_compare_detail_table(self, detail_text: str) -> str:
+    def _format_rest_compare_detail_table(self, detail_text: str, *, heading_level: int = 2) -> str:
         rows = self._parse_rest_compare_details(detail_text)
+        heading = "#" * max(1, heading_level)
         if not rows:
-            return "## REST验证失败OHLCV/Q明细(agg->rest)\n\n无明细"
+            return f"{heading} REST验证失败OHLCV/Q明细(agg->rest)\n\n无明细"
         lines = [
-            "## REST验证失败OHLCV/Q明细(agg->rest)",
+            f"{heading} REST验证失败OHLCV/Q明细(agg->rest)",
             "",
             "| Symbol | 字段 | Agg | REST | 绝对误差 | 百分比 |",
             "|---|---|---:|---:|---:|---:|",
@@ -2024,7 +2139,7 @@ class App:
             return text if text.endswith("%") else f"{text}%"
         return f"{text}%"
 
-    def _format_rest_compare_summary(self, summary: dict[str, int | float | str | bool] | None) -> str:
+    def _format_rest_compare_summary(self, summary: dict[str, object] | None) -> str:
         if self._klines_source != "aggtrade":
             return "n/a"
         if not self._cfg.websocket.aggtrade_compare_with_kline:

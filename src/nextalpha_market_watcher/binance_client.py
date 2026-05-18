@@ -7,6 +7,7 @@ import logging
 import base64
 import math
 import os
+import random
 import socket
 import time
 from collections import deque
@@ -152,6 +153,17 @@ class _AggTradeBar:
         )
 
 
+@dataclass(slots=True)
+class _AggTradeRestCompareRequest:
+    close_time_ms: int
+    symbols: tuple[str, ...]
+    snapshot_offset_ms: int
+    snapshot_due_ms: int
+    snapshot_label: str
+    sample: bool
+    final: bool
+
+
 class _AggTradeKlineComparator:
     def __init__(
         self,
@@ -163,9 +175,13 @@ class _AggTradeKlineComparator:
         price_tolerance: Decimal,
         volume_tolerance: Decimal,
         quote_tolerance: Decimal,
-        rest_compare_queue: asyncio.Queue[tuple[int, tuple[str, ...]]] | None = None,
+        rest_compare_queue: asyncio.Queue[_AggTradeRestCompareRequest] | None = None,
         summary_callback: AggTradeCompareSummaryCallback | None = None,
         min_validate_open_time_ms: int = 0,
+        diagnostic_enabled: bool = True,
+        diagnostic_sample_size: int = 50,
+        diagnostic_offsets_ms: tuple[int, ...] = (800, 1800, 3000, 5000),
+        final_compare_delay_ms: int = 10_000,
         mismatch_log_limit_per_close: int = 20,
         retain_close_times: int = 12,
     ) -> None:
@@ -179,8 +195,15 @@ class _AggTradeKlineComparator:
         self._rest_compare_queue = rest_compare_queue
         self._summary_callback = summary_callback
         self._min_validate_open_time_ms = min_validate_open_time_ms
+        self._diagnostic_enabled = diagnostic_enabled
+        self._diagnostic_sample_size = max(1, diagnostic_sample_size)
+        self._diagnostic_offsets_ms = tuple(
+            sorted({max(0, int(offset_ms)) for offset_ms in diagnostic_offsets_ms})
+        )
+        self._final_compare_delay_ms = max(0, final_compare_delay_ms)
         self._mismatch_log_limit_per_close = max(0, mismatch_log_limit_per_close)
         self._retain_close_times = max(2, retain_close_times)
+        self._live_bars_by_close: dict[int, dict[str, _AggTradeBar]] = {}
         self._agg_by_close: dict[int, dict[str, ClosedKline]] = {}
         self._kline_by_close: dict[int, dict[str, ClosedKline]] = {}
         self._missing_reference_by_close: dict[int, set[str]] = {}
@@ -190,7 +213,7 @@ class _AggTradeKlineComparator:
         self._mismatch_by_close: dict[int, list[str]] = {}
         self._mismatch_details_by_close: dict[int, list[dict[str, object]]] = {}
         self._target_symbols_by_close: dict[int, set[str]] = {}
-        self._queued_rest_compare: set[int] = set()
+        self._queued_rest_compare: set[tuple[int, str]] = set()
         self._summary_done: set[int] = set()
         self._close_order: deque[int] = deque()
         self._shard_connected_ms: dict[str, int] = {}
@@ -226,6 +249,35 @@ class _AggTradeKlineComparator:
             self._compare(kline, strict)
         self._cleanup()
 
+    def record_trade(
+        self,
+        *,
+        symbol: str,
+        open_time_ms: int,
+        close_time_ms: int,
+        price: Decimal,
+        quantity: Decimal,
+        trade_time_ms: int,
+        event_time_ms: int,
+    ) -> None:
+        self._remember_close(close_time_ms)
+        bucket = self._live_bars_by_close.setdefault(close_time_ms, {})
+        bar = bucket.get(symbol)
+        if bar is None:
+            bucket[symbol] = _AggTradeBar.from_trade(
+                symbol=symbol,
+                interval=self._interval,
+                open_time_ms=open_time_ms,
+                close_time_ms=close_time_ms,
+                price=price,
+                quantity=quantity,
+                trade_time_ms=trade_time_ms,
+                event_time_ms=event_time_ms,
+            )
+        else:
+            bar.update(price, quantity, trade_time_ms, event_time_ms)
+        self._cleanup()
+
     async def record_kline(self, kline: ClosedKline) -> None:
         self._remember_close(kline.close_time_ms)
         self._kline_by_close.setdefault(kline.close_time_ms, {})[kline.symbol] = kline
@@ -259,8 +311,221 @@ class _AggTradeKlineComparator:
         )
         self._cleanup()
 
+    def snapshot_agg(
+        self,
+        close_time_ms: int,
+        symbols: tuple[str, ...],
+        *,
+        snapshot_ms: int,
+    ) -> dict[str, ClosedKline]:
+        return self._snapshot_agg_bucket(close_time_ms, symbols, snapshot_ms=snapshot_ms)
+
+    def _snapshot_agg_bucket(
+        self,
+        close_time_ms: int,
+        symbols: tuple[str, ...] | list[str],
+        *,
+        snapshot_ms: int | None = None,
+    ) -> dict[str, ClosedKline]:
+        now_ms = snapshot_ms if snapshot_ms is not None else int(time.time() * 1000)
+        live_bucket = self._live_bars_by_close.get(close_time_ms, {})
+        emitted_bucket = self._agg_by_close.get(close_time_ms, {})
+        out: dict[str, ClosedKline] = {}
+        for symbol in symbols:
+            bar = live_bucket.get(symbol)
+            if bar is not None:
+                out[symbol] = bar.to_closed_kline(
+                    ingest_time_ms=now_ms,
+                    shard_id="aggtrade:diagnostic",
+                    shard_symbol_count=len(symbols),
+                    total_shards=0,
+                )
+                continue
+            emitted = emitted_bucket.get(symbol)
+            if emitted is not None:
+                out[symbol] = emitted
+        return out
+
+    async def finish_compare_request(
+        self,
+        request: _AggTradeRestCompareRequest,
+        *,
+        local_snapshot: dict[str, ClosedKline],
+        rest_snapshot: dict[str, ClosedKline],
+        rest_missing: set[str],
+        rest_errors: list[str],
+        validation_delay_seconds: float = 0.0,
+        validation_fetch_elapsed_ms: int = 0,
+        validation_total_elapsed_ms: int = 0,
+        snapshot_started_ms: int = 0,
+    ) -> None:
+        summary = self._build_compare_summary(
+            request,
+            local_snapshot=local_snapshot,
+            rest_snapshot=rest_snapshot,
+            rest_missing=rest_missing,
+            rest_errors=rest_errors,
+            validation_delay_seconds=validation_delay_seconds,
+            validation_fetch_elapsed_ms=validation_fetch_elapsed_ms,
+            validation_total_elapsed_ms=validation_total_elapsed_ms,
+            snapshot_started_ms=snapshot_started_ms,
+        )
+        if request.final:
+            self._summary_done.add(request.close_time_ms)
+        if self._summary_callback is not None:
+            try:
+                await self._summary_callback(summary)
+            except Exception:
+                logger.exception(
+                    "aggtrade.rest_compare.summary_callback_failed interval=%s close_time_ms=%s snapshot=%s",
+                    self._interval,
+                    request.close_time_ms,
+                    request.snapshot_label,
+                )
+        self._cleanup()
+
+    def _build_compare_summary(
+        self,
+        request: _AggTradeRestCompareRequest,
+        *,
+        local_snapshot: dict[str, ClosedKline],
+        rest_snapshot: dict[str, ClosedKline],
+        rest_missing: set[str],
+        rest_errors: list[str],
+        validation_delay_seconds: float,
+        validation_fetch_elapsed_ms: int,
+        validation_total_elapsed_ms: int,
+        snapshot_started_ms: int,
+    ) -> dict[str, int | float | str | bool]:
+        target_symbols = set(request.symbols)
+        strict_symbols = set(rest_snapshot.keys())
+        agg_symbols = set(local_snapshot.keys())
+        missing_agg = sorted(target_symbols - agg_symbols)
+        missing_reference = sorted((target_symbols - strict_symbols) | rest_missing)
+        mismatches: list[str] = []
+        mismatch_details: list[dict[str, object]] = []
+        matched = 0
+        for symbol in sorted(target_symbols & agg_symbols & strict_symbols):
+            agg = local_snapshot[symbol]
+            strict = rest_snapshot[symbol]
+            diffs: list[str] = []
+            detail_fields: list[dict[str, object]] = []
+            self._append_decimal_diff(
+                diffs, detail_fields, "open", "O", agg.open_price, strict.open_price, self._price_tolerance
+            )
+            self._append_decimal_diff(
+                diffs, detail_fields, "high", "H", agg.high_price, strict.high_price, self._price_tolerance
+            )
+            self._append_decimal_diff(
+                diffs, detail_fields, "low", "L", agg.low_price, strict.low_price, self._price_tolerance
+            )
+            self._append_decimal_diff(
+                diffs, detail_fields, "close", "C", agg.close_price, strict.close_price, self._price_tolerance
+            )
+            self._append_decimal_diff(
+                diffs, detail_fields, "volume", "V", agg.volume, strict.volume, self._volume_tolerance
+            )
+            self._append_decimal_diff(
+                diffs, detail_fields, "quote", "Q", agg.quote_volume, strict.quote_volume, self._quote_tolerance
+            )
+            if diffs:
+                mismatches.append(f"{symbol}({','.join(diffs)})")
+                mismatch_details.append({"symbol": symbol, "fields": detail_fields})
+            else:
+                matched += 1
+        mismatch_error_stats = self._format_mismatch_error_stats(mismatch_details)
+        mismatch_error_buckets = self._format_mismatch_error_buckets(mismatch_details)
+        mismatch_detail_all = self._format_mismatch_detail_all(mismatch_details)
+        price_mismatch_symbols, vq_gt_1pct_symbols = self._business_mismatch_counts(mismatch_details)
+        expected_count = len(target_symbols)
+        summary: dict[str, int | float | str | bool] = {
+            "interval": self._interval,
+            "close_time_ms": request.close_time_ms,
+            "expected": expected_count,
+            "rest_kline": len(rest_snapshot),
+            "aggtrade": len(local_snapshot),
+            "matched": matched,
+            "mismatched": len(mismatches),
+            "missing_agg": len(missing_agg),
+            "missing_rest": len(missing_reference),
+            "rest_errors": len(rest_errors),
+            "extra_agg": 0,
+            "missing_agg_sample": ",".join(missing_agg[:20]) if missing_agg else "-",
+            "missing_rest_sample": ",".join(missing_reference[:20]) if missing_reference else "-",
+            "mismatch_sample": "；".join(mismatches[:10]) if mismatches else "-",
+            "mismatch_error_stats": mismatch_error_stats,
+            "mismatch_error_buckets": mismatch_error_buckets,
+            "mismatch_detail_all": mismatch_detail_all,
+            "rest_error_sample": "；".join(rest_errors[:10]) if rest_errors else "-",
+            "extra_sample": "-",
+            "validation_delay_seconds": validation_delay_seconds,
+            "validation_fetch_elapsed_ms": validation_fetch_elapsed_ms,
+            "validation_total_elapsed_ms": validation_total_elapsed_ms,
+            "snapshot_label": request.snapshot_label,
+            "snapshot_offset_ms": request.snapshot_offset_ms,
+            "snapshot_started_ms": snapshot_started_ms,
+            "diagnostic_sample": request.sample,
+            "diagnostic_final": request.final,
+            "sample_size": expected_count if request.sample else 0,
+            "price_mismatch_symbols": price_mismatch_symbols,
+            "vq_gt_1pct_symbols": vq_gt_1pct_symbols,
+            "business_passed": (
+                price_mismatch_symbols == 0
+                and vq_gt_1pct_symbols == 0
+                and not missing_agg
+                and not missing_reference
+                and not rest_errors
+            ),
+            "passed": (
+                expected_count > 0
+                and len(local_snapshot) >= expected_count
+                and len(rest_snapshot) >= expected_count
+                and matched >= expected_count
+                and not mismatches
+                and not missing_agg
+                and not missing_reference
+                and not rest_errors
+            ),
+        }
+        logger.info(
+            "aggtrade.rest_compare.summary interval=%s close_time_ms=%s snapshot=%s expected=%s rest_kline=%s aggtrade=%s matched=%s mismatched=%s missing_agg=%s missing_rest=%s rest_errors=%s price_mismatch_symbols=%s vq_gt_1pct_symbols=%s",
+            summary["interval"],
+            summary["close_time_ms"],
+            summary["snapshot_label"],
+            summary["expected"],
+            summary["rest_kline"],
+            summary["aggtrade"],
+            summary["matched"],
+            summary["mismatched"],
+            summary["missing_agg"],
+            summary["missing_rest"],
+            summary["rest_errors"],
+            summary["price_mismatch_symbols"],
+            summary["vq_gt_1pct_symbols"],
+        )
+        return summary
+
+    def _business_mismatch_counts(self, mismatch_details: list[dict[str, object]]) -> tuple[int, int]:
+        price_symbols: set[str] = set()
+        vq_gt_1pct_symbols: set[str] = set()
+        for item in mismatch_details:
+            symbol = str(item.get("symbol") or "")
+            for field in self._iter_detail_fields(item):
+                label = str(field.get("label") or "?")
+                pct_error = field.get("pct_error")
+                if label in {"O", "H", "L", "C"}:
+                    price_symbols.add(symbol)
+                elif label in {"V", "Q"} and isinstance(pct_error, Decimal) and pct_error > Decimal("1"):
+                    vq_gt_1pct_symbols.add(symbol)
+        return len(price_symbols), len(vq_gt_1pct_symbols)
+
     def _remember_close(self, close_time_ms: int) -> None:
-        if close_time_ms in self._agg_by_close or close_time_ms in self._kline_by_close:
+        if (
+            close_time_ms in self._live_bars_by_close
+            or close_time_ms in self._agg_by_close
+            or close_time_ms in self._kline_by_close
+            or close_time_ms in self._close_order
+        ):
             return
         self._close_order.append(close_time_ms)
 
@@ -386,19 +651,24 @@ class _AggTradeKlineComparator:
         return (abs_error / denominator) * Decimal("100")
 
     async def request_rest_compare(self, close_time_ms: int, symbols: set[str]) -> bool:
-        if self._rest_compare_queue is None or close_time_ms in self._queued_rest_compare:
+        if self._rest_compare_queue is None:
             return False
         if close_time_ms in self._summary_done:
             return False
+        live_bucket = self._live_bars_by_close.get(close_time_ms, {})
         agg_bucket = self._agg_by_close.get(close_time_ms, {})
         target_symbols = {
             symbol
             for symbol in symbols
-            if symbol in self._expected_symbols and symbol in agg_bucket
+            if symbol in self._expected_symbols and (symbol in live_bucket or symbol in agg_bucket)
         }
         if not target_symbols:
             return False
         sample = next((agg_bucket.get(symbol) for symbol in sorted(target_symbols)), None)
+        if sample is None:
+            sample = self._snapshot_agg_bucket(close_time_ms, sorted(target_symbols)).get(
+                next(iter(sorted(target_symbols)))
+            )
         if sample is None:
             return False
         if sample.open_time_ms < self._min_validate_open_time_ms:
@@ -410,24 +680,73 @@ class _AggTradeKlineComparator:
             )
             return True
         self._target_symbols_by_close[close_time_ms] = target_symbols
-        try:
-            self._rest_compare_queue.put_nowait((close_time_ms, tuple(sorted(target_symbols))))
-        except asyncio.QueueFull:
-            logger.warning(
-                "aggtrade.rest_compare.queue_full interval=%s close_time_ms=%s queued=%s",
-                self._interval,
-                close_time_ms,
-                len(self._queued_rest_compare),
-            )
+        requests = self._build_rest_compare_requests(close_time_ms, target_symbols)
+        queued = 0
+        for request in requests:
+            queue_key = (close_time_ms, request.snapshot_label)
+            if queue_key in self._queued_rest_compare:
+                continue
+            try:
+                self._rest_compare_queue.put_nowait(request)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "aggtrade.rest_compare.queue_full interval=%s close_time_ms=%s queued=%s",
+                    self._interval,
+                    close_time_ms,
+                    len(self._queued_rest_compare),
+                )
+                break
+            self._queued_rest_compare.add(queue_key)
+            queued += 1
+        if queued <= 0:
             return False
-        self._queued_rest_compare.add(close_time_ms)
         logger.info(
-            "aggtrade.rest_compare.queued interval=%s close_time_ms=%s symbols=%s",
+            "aggtrade.rest_compare.queued interval=%s close_time_ms=%s symbols=%s requests=%s",
             self._interval,
             close_time_ms,
             len(target_symbols),
+            queued,
         )
         return True
+
+    def _build_rest_compare_requests(
+        self,
+        close_time_ms: int,
+        target_symbols: set[str],
+    ) -> list[_AggTradeRestCompareRequest]:
+        close_boundary_ms = close_time_ms + 1
+        sorted_symbols = tuple(sorted(target_symbols))
+        requests: list[_AggTradeRestCompareRequest] = []
+        if self._diagnostic_enabled:
+            sample_size = min(self._diagnostic_sample_size, len(sorted_symbols))
+            sample_symbols = tuple(
+                sorted(random.Random(close_time_ms).sample(list(sorted_symbols), sample_size))
+            )
+            for offset_ms in self._diagnostic_offsets_ms:
+                requests.append(
+                    _AggTradeRestCompareRequest(
+                        close_time_ms=close_time_ms,
+                        symbols=sample_symbols,
+                        snapshot_offset_ms=offset_ms,
+                        snapshot_due_ms=close_boundary_ms + offset_ms,
+                        snapshot_label=f"{offset_ms}ms",
+                        sample=True,
+                        final=False,
+                    )
+                )
+        final_label = f"{self._final_compare_delay_ms}ms"
+        requests.append(
+            _AggTradeRestCompareRequest(
+                close_time_ms=close_time_ms,
+                symbols=sorted_symbols,
+                snapshot_offset_ms=self._final_compare_delay_ms,
+                snapshot_due_ms=close_boundary_ms + self._final_compare_delay_ms,
+                snapshot_label=final_label,
+                sample=False,
+                final=True,
+            )
+        )
+        return requests
 
     async def _skip_rest_compare(
         self,
@@ -601,6 +920,7 @@ class _AggTradeKlineComparator:
     def _cleanup(self) -> None:
         while len(self._close_order) > self._retain_close_times:
             expired = self._close_order.popleft()
+            self._live_bars_by_close.pop(expired, None)
             self._agg_by_close.pop(expired, None)
             self._kline_by_close.pop(expired, None)
             self._missing_reference_by_close.pop(expired, None)
@@ -609,7 +929,7 @@ class _AggTradeKlineComparator:
             self._mismatch_by_close.pop(expired, None)
             self._mismatch_details_by_close.pop(expired, None)
             self._target_symbols_by_close.pop(expired, None)
-            self._queued_rest_compare.discard(expired)
+            self._queued_rest_compare = {key for key in self._queued_rest_compare if key[0] != expired}
             self._summary_done.discard(expired)
             self._compared = {key for key in self._compared if key[0] != expired}
 
@@ -1134,6 +1454,9 @@ class BinanceClient:
         compare_with_rest_kline: bool = True,
         rest_compare_delay_seconds: float = 2.0,
         rest_compare_concurrency: int = 8,
+        rest_diagnostic_enabled: bool = True,
+        rest_diagnostic_sample_size: int = 50,
+        rest_diagnostic_offsets_ms: tuple[int, ...] = (800, 1800, 3000, 5000),
         price_tolerance: Decimal = Decimal("0"),
         volume_tolerance: Decimal = Decimal("0.00000001"),
         quote_tolerance: Decimal = Decimal("0.000001"),
@@ -1158,7 +1481,8 @@ class BinanceClient:
         # The current candle may be partial if the service starts mid-interval.
         # Only compare candles whose full interval was observed from aggTrade.
         min_validate_open_time_ms = ((now_ms // interval_ms) + 1) * interval_ms
-        rest_compare_queue: asyncio.Queue[tuple[int, tuple[str, ...]]] | None = (
+        final_compare_delay_ms = int(max(0.0, rest_compare_delay_seconds) * 1000)
+        rest_compare_queue: asyncio.Queue[_AggTradeRestCompareRequest] | None = (
             asyncio.Queue(maxsize=max(100, len(symbols) * 2)) if compare_with_rest_kline else None
         )
         comparator = (
@@ -1173,6 +1497,10 @@ class BinanceClient:
                 rest_compare_queue=rest_compare_queue,
                 summary_callback=rest_compare_summary_callback,
                 min_validate_open_time_ms=min_validate_open_time_ms,
+                diagnostic_enabled=rest_diagnostic_enabled,
+                diagnostic_sample_size=rest_diagnostic_sample_size,
+                diagnostic_offsets_ms=rest_diagnostic_offsets_ms,
+                final_compare_delay_ms=final_compare_delay_ms,
             )
             if compare_with_rest_kline
             else None
@@ -1246,7 +1574,7 @@ class BinanceClient:
         self,
         interval: str,
         comparator: _AggTradeKlineComparator,
-        close_queue: asyncio.Queue[tuple[int, tuple[str, ...]]],
+        close_queue: asyncio.Queue[_AggTradeRestCompareRequest],
         *,
         delay_seconds: float,
         concurrency: int,
@@ -1255,7 +1583,14 @@ class BinanceClient:
         timeout = httpx.Timeout(self._cfg.backfill.rest_timeout_seconds)
         request_delay_seconds = max(0.0, self._cfg.backfill.rest_request_delay_seconds)
 
-        async def fetch_one(client: httpx.AsyncClient, close_time_ms: int, symbol: str) -> None:
+        async def fetch_one(
+            client: httpx.AsyncClient,
+            close_time_ms: int,
+            symbol: str,
+            rest_results: dict[str, ClosedKline],
+            rest_errors: list[str],
+            rest_missing: set[str],
+        ) -> None:
             async with sem:
                 for attempt in range(2):
                     if request_delay_seconds > 0:
@@ -1281,7 +1616,7 @@ class BinanceClient:
                             )
                             await asyncio.sleep(retry_after_seconds)
                             continue
-                        await comparator.record_reference_error(close_time_ms, symbol, str(exc))
+                        rest_errors.append(f"{symbol}({exc})")
                         logger.warning(
                             "aggtrade.rest_compare.fetch_fail interval=%s close_time_ms=%s symbol=%s error=%s",
                             interval,
@@ -1291,7 +1626,7 @@ class BinanceClient:
                         )
                         return
                     except Exception as exc:
-                        await comparator.record_reference_error(close_time_ms, symbol, str(exc))
+                        rest_errors.append(f"{symbol}({exc})")
                         logger.warning(
                             "aggtrade.rest_compare.fetch_fail interval=%s close_time_ms=%s symbol=%s error=%s",
                             interval,
@@ -1301,34 +1636,59 @@ class BinanceClient:
                         )
                         return
                     if kline is None:
-                        await comparator.record_reference_missing(close_time_ms, symbol)
+                        rest_missing.add(symbol)
                         return
-                    await comparator.record_kline(kline)
+                    rest_results[symbol] = kline
                     return
 
         async with httpx.AsyncClient(timeout=timeout, proxy=self._cfg.binance.rest_proxy_url) as client:
             while True:
-                close_time_ms, target_symbols = await close_queue.get()
+                request = await close_queue.get()
                 queued_started_ms = int(time.time() * 1000)
                 try:
-                    if delay_seconds > 0:
-                        await asyncio.sleep(delay_seconds)
+                    wait_ms = request.snapshot_due_ms - int(time.time() * 1000)
+                    if wait_ms > 0:
+                        await asyncio.sleep(wait_ms / 1000)
                     fetch_started_ms = int(time.time() * 1000)
+                    local_snapshot = comparator.snapshot_agg(
+                        request.close_time_ms,
+                        request.symbols,
+                        snapshot_ms=fetch_started_ms,
+                    )
+                    rest_results: dict[str, ClosedKline] = {}
+                    rest_errors: list[str] = []
+                    rest_missing: set[str] = set()
                     await asyncio.gather(
-                        *(fetch_one(client, close_time_ms, symbol) for symbol in target_symbols)
+                        *(
+                            fetch_one(
+                                client,
+                                request.close_time_ms,
+                                symbol,
+                                rest_results,
+                                rest_errors,
+                                rest_missing,
+                            )
+                            for symbol in request.symbols
+                        )
                     )
                     finished_ms = int(time.time() * 1000)
-                    await comparator.finish_close(
-                        close_time_ms,
-                        validation_delay_seconds=delay_seconds,
+                    await comparator.finish_compare_request(
+                        request,
+                        local_snapshot=local_snapshot,
+                        rest_snapshot=rest_results,
+                        rest_missing=rest_missing,
+                        rest_errors=rest_errors,
+                        validation_delay_seconds=request.snapshot_offset_ms / 1000,
                         validation_fetch_elapsed_ms=max(0, finished_ms - fetch_started_ms),
                         validation_total_elapsed_ms=max(0, finished_ms - queued_started_ms),
+                        snapshot_started_ms=fetch_started_ms,
                     )
                     logger.info(
-                        "aggtrade.rest_compare.done interval=%s close_time_ms=%s symbols=%s elapsed_ms=%s",
+                        "aggtrade.rest_compare.done interval=%s close_time_ms=%s snapshot=%s symbols=%s elapsed_ms=%s",
                         interval,
-                        close_time_ms,
-                        len(target_symbols),
+                        request.close_time_ms,
+                        request.snapshot_label,
+                        len(request.symbols),
                         int(time.time() * 1000) - queued_started_ms,
                     )
                 finally:
@@ -1607,6 +1967,16 @@ class BinanceClient:
                                     )
                                 continue
                             close_time_ms = open_time_ms + interval_ms - 1
+                            if comparator is not None:
+                                comparator.record_trade(
+                                    symbol=symbol,
+                                    open_time_ms=open_time_ms,
+                                    close_time_ms=close_time_ms,
+                                    price=price,
+                                    quantity=quantity,
+                                    trade_time_ms=trade_time_ms,
+                                    event_time_ms=event_time_ms,
+                                )
                             if close_time_ms <= self._aggtrade_published_close_ms.get(interval, 0):
                                 continue
                             key = (symbol, open_time_ms)
