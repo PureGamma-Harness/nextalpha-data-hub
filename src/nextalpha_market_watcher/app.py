@@ -1998,7 +1998,11 @@ class App:
                 try:
                     batch_size = int(batch.get("batch_size") or 0)
                     expected_total = int(batch.get("expected_symbols") or expected or 0)
-                    missing_total = int(batch.get("missing_symbols") or max(0, expected - len(values)))
+                    raw_missing = batch.get("missing_symbols")
+                    if raw_missing is None:
+                        missing_total = max(0, expected - len(values))
+                    else:
+                        missing_total = int(raw_missing)
                     close_to_publish_ms = int(batch.get("close_time_to_publish_ms") or 0)
                     publish_to_push_done_ms = int(batch.get("service_ws_shards_push_done_ms") or 0)
                     ingest_spread_ms = int(batch.get("service_ingest_spread_ms") or 0)
