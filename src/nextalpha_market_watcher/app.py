@@ -1704,7 +1704,6 @@ class App:
             self._batch_summary_by_close.pop(close_time_ms, None)
             self._batch_metric_values_by_close.pop(close_time_ms, None)
             self._rest_compare_summary_by_close.pop(close_time_ms, None)
-            self._rest_compare_snapshots_by_close.pop(close_time_ms, None)
             self._rest_compare_events_by_close.pop(close_time_ms, None)
             self._passthrough_shards_sent_by_close.pop(close_time_ms, None)
             self._passthrough_total_shards_by_close.pop(close_time_ms, None)
