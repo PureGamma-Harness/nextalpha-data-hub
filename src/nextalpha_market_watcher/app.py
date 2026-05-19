@@ -63,6 +63,7 @@ class App:
         self._major_1m_interval = self._cfg.websocket.klines_major_1m_interval.strip() or "1m"
         self._major_1m_topic = self._cfg.websocket.klines_major_1m_topic.strip() or "klines.majors.1m"
         self._major_1m_enabled = bool(self._cfg.websocket.klines_major_1m_enabled)
+        self._major_1m_publish_every_minutes = max(1, self._cfg.websocket.klines_major_1m_publish_every_minutes)
         self._klines_stream_key = self._klines_interval
         self._major_1h_stream_key = f"{self._major_1h_interval}:{self._major_1h_topic}"
         self._major_1m_stream_key = f"{self._major_1m_interval}:{self._major_1m_topic}"
@@ -803,6 +804,8 @@ class App:
                 continue
             latest_close_by_symbol[kline.symbol] = kline.close_time_ms
             self._ingest_1h += 1
+            if not self._should_publish_major_kline_topic(topic, kline.interval, kline.close_time_ms):
+                continue
             complete_rows: dict[str, dict] | None = None
             first_ingest_ms: int | None = None
             batch_key = (topic, kline.close_time_ms)
@@ -836,6 +839,8 @@ class App:
     ) -> None:
         if self._klines_ws is None or not topic or not expected_symbols:
             return
+        if not self._should_publish_major_kline_topic(topic, kline.interval, kline.close_time_ms):
+            return
         self._major_expected_symbols_by_topic[topic] = expected_symbols
         complete_rows: dict[str, dict] | None = None
         first_ingest_ms: int | None = None
@@ -860,6 +865,17 @@ class App:
                 notify_summary=True,
                 track_latency=True,
             )
+
+    def _should_publish_major_kline_topic(self, topic: str, interval: str, close_time_ms: int) -> bool:
+        if topic != self._major_1m_topic or interval != self._major_1m_interval:
+            return True
+        cadence = self._major_1m_publish_every_minutes
+        if cadence <= 1:
+            return True
+        # Binance close_time_ms is the last millisecond of the candle. Add 1ms
+        # to align checks to the next minute boundary.
+        boundary = datetime.fromtimestamp((close_time_ms + 1) / 1000)
+        return boundary.minute % cadence == 0
 
     async def _run_major_stale_flush(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

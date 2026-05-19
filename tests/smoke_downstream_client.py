@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import time
+import textwrap
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -16,6 +17,25 @@ DEFAULT_TOPICS = "klines.all.1h,klines.majors.1h"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Mock downstream WebSocket consumer for closed kline feed",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """
+            Examples:
+              # Full-market 1h and major-symbol 1h batches from the kline service.
+              python tests/smoke_downstream_client.py \\
+                --ws-url ws://127.0.0.1:8766/ws/klines \\
+                --topics klines.all.1h,klines.majors.1h \\
+                --klines-interval 1h \\
+                --ack-enabled
+
+              # Major-symbol 1m batches reused from the alert service ingestion path.
+              python tests/smoke_downstream_client.py \\
+                --ws-url ws://127.0.0.1:8765/ws/klines \\
+                --topics klines.majors.1m \\
+                --klines-interval 1m \\
+                --ack-enabled
+            """,
+        ),
     )
     parser.add_argument(
         "--ws-url",

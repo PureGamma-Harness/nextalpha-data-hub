@@ -86,6 +86,8 @@ websocket:
   klines_major_1m_enabled: false
   klines_major_1m_interval: 1m
   klines_major_1m_topic: klines.majors.1m
+  # 1 means every minute; 15 means publish 00/15/30/45 minute closes only.
+  klines_major_1m_publish_every_minutes: 15
   klines_major_batch_max_wait_ms: 3000
   # false：同一收盘时刻服务端聚齐后整批一次下发；true：分片到达即推（多轮）
   klines_passthrough_mode: false

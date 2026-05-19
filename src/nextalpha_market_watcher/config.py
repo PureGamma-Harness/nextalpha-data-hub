@@ -92,6 +92,8 @@ class WebSocketPushConfig(BaseModel):
     klines_major_1m_enabled: bool = False
     klines_major_1m_interval: str = "1m"
     klines_major_1m_topic: str = "klines.majors.1m"
+    # Publish 1m kline topic only on this minute cadence. 1 means every minute.
+    klines_major_1m_publish_every_minutes: int = 1
     klines_major_batch_max_wait_ms: int = 3_000
     # If True, publish each closed kline row immediately to downstream clients
     # without server-side close_time batch aggregation.

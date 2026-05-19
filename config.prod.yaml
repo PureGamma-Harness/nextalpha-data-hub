@@ -88,6 +88,7 @@ websocket:
   klines_major_1m_enabled: false
   klines_major_1m_interval: 1m
   klines_major_1m_topic: klines.majors.1m
+  klines_major_1m_publish_every_minutes: 15
   klines_major_batch_max_wait_ms: 3000
   # false：同一 close_time 在服务端聚齐（或达放行策略）后，整批 list 一次下发
   klines_passthrough_mode: false
