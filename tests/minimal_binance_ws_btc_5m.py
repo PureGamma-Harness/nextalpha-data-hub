@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--proxy",
         default=None,
-        help="Optional proxy URL, e.g. http://host.docker.internal:10808",
+        help="Optional proxy URL, e.g. http://host.docker.internal:7890",
     )
     return parser.parse_args()
 

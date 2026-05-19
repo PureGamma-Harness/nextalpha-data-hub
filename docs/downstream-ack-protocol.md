@@ -8,11 +8,12 @@ Required fields:
 - `event_id`: same as upstream payload (`symbol:1h:open_time_ms`)
 - `downstream_receive_ms`: consumer receipt timestamp in milliseconds
 - `downstream_region`: consumer deployment region tag (example: `ap-northeast-1`)
+- `topic`: topic from the WebSocket row when present (example: `klines.all.1h`)
 
 Example:
 
 ```text
-XADD stream:kline:1h:ack * event_id BTCUSDT:1h:1713754800000 downstream_receive_ms 1713758400450 downstream_region ap-northeast-1
+XADD stream:kline:1h:ack * event_id BTCUSDT:1h:1713754800000 downstream_receive_ms 1713758400450 downstream_region ap-northeast-1 topic klines.all.1h
 ```
 
 The watcher computes:
@@ -40,6 +41,7 @@ Common fields:
 
 - `type`: one of the types above
 - `close_time_ms`: close time for the batch
+- `topic`: topic from the WebSocket row (required when subscribing to non-default topics)
 - `downstream_region`: client region tag
 - `batch_push_done_ms`: echo from server payload when available (preferred)
 

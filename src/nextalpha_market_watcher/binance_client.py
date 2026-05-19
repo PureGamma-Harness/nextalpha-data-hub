@@ -119,6 +119,7 @@ class BinanceClient:
         self._ws_watchdog_alerted: dict[str, bool] = {}
         self._ws_shard_last_event_ms: dict[str, dict[str, int]] = {}
         self._ws_shard_watchdog_alerted: dict[str, dict[str, bool]] = {}
+        self._ws_activity_interval: dict[str, str] = {}
         # Debug: print first kline payload structure per interval/shard.
         self._ws_parse_debug_logged: set[str] = set()
 
@@ -349,6 +350,7 @@ class BinanceClient:
         interval: str,
         symbols: list[str],
         out_queue: asyncio.Queue[ClosedKline],
+        activity_key: str | None = None,
     ) -> None:
         if (
             interval == "1m"
@@ -357,9 +359,10 @@ class BinanceClient:
         ):
             return
         silence_threshold_ms = 30_000
+        activity_key = activity_key or interval
         while True:
             await asyncio.sleep(10)
-            last_ms = self._ws_last_event_ms.get(interval, 0)
+            last_ms = self._ws_last_event_ms.get(activity_key, 0)
             if last_ms <= 0:
                 continue
             now_ms = int(time.time() * 1000)
@@ -367,8 +370,9 @@ class BinanceClient:
             if no_event_ms < silence_threshold_ms:
                 continue
             logger.warning(
-                "ws.silence.rest_repair interval=%s no_event_ms=%s symbols=%s",
+                "ws.silence.rest_repair interval=%s stream=%s no_event_ms=%s symbols=%s",
                 interval,
+                activity_key,
                 no_event_ms,
                 len(symbols),
             )
@@ -381,6 +385,7 @@ class BinanceClient:
         symbols: list[str],
         interval: str,
         batch_size: int = 200,
+        stream_key: str | None = None,
     ) -> AsyncIterator[ClosedKline]:
         # Keep the target batch size, but split further when the combined stream
         # query becomes too long. This avoids silent WS subscriptions with no data.
@@ -391,26 +396,30 @@ class BinanceClient:
             # SUBSCRIBE mode does not need long URL query splitting.
             max_streams_query_chars=0,
         )
-        shard_ids = [f"{interval}#{idx}" for idx in range(len(symbol_batches))]
+        activity_key = stream_key or interval
+        self._ws_activity_interval[activity_key] = interval
+        shard_ids = [f"{activity_key}#{idx}" for idx in range(len(symbol_batches))]
         queue: asyncio.Queue[ClosedKline] = asyncio.Queue(maxsize=10000)
         tasks = [
-            asyncio.create_task(self._consume_batch(batch, interval, shard_ids[idx], queue, len(shard_ids)))
+            asyncio.create_task(
+                self._consume_batch(batch, interval, shard_ids[idx], queue, len(shard_ids), activity_key),
+            )
             for idx, batch in enumerate(symbol_batches)
             if batch and idx < len(shard_ids)
         ]
         rest_repair_task = asyncio.create_task(
-            self._run_ws_silence_rest_repair(interval, symbols, queue),
+            self._run_ws_silence_rest_repair(interval, symbols, queue, activity_key),
         )
         watchdog_task: asyncio.Task[None] | None = None
         if self._cfg.binance.ws_watchdog_enabled:
-            self._ws_last_event_ms[interval] = int(time.time() * 1000)
-            self._ws_watchdog_alerted[interval] = False
-            self._ws_shard_last_event_ms[interval] = {
+            self._ws_last_event_ms[activity_key] = int(time.time() * 1000)
+            self._ws_watchdog_alerted[activity_key] = False
+            self._ws_shard_last_event_ms[activity_key] = {
                 shard_id: int(time.time() * 1000) for shard_id in shard_ids
             }
-            self._ws_shard_watchdog_alerted[interval] = {shard_id: False for shard_id in shard_ids}
+            self._ws_shard_watchdog_alerted[activity_key] = {shard_id: False for shard_id in shard_ids}
             watchdog_task = asyncio.create_task(
-                self._run_ws_watchdog(interval, len(symbols), shard_ids),
+                self._run_ws_watchdog(interval, len(symbols), shard_ids, activity_key),
             )
         try:
             while True:
@@ -481,6 +490,7 @@ class BinanceClient:
         shard_id: str,
         out_queue: asyncio.Queue[ClosedKline],
         total_shards: int,
+        activity_key: str,
     ) -> None:
         stream_names = [f"{s.lower()}@kline_{interval}" for s in symbols]
         fast_skipped_metric = WS_KLINE_FAST_SKIPPED.labels(interval)
@@ -547,11 +557,11 @@ class BinanceClient:
                             # This prevents watchdog false positives when only non-closed kline
                             # updates (x=false) are flowing between close boundaries.
                             now_ms = int(time.time() * 1000)
-                            self._ws_last_event_ms[interval] = now_ms
-                            interval_shards = self._ws_shard_last_event_ms.setdefault(interval, {})
+                            self._ws_last_event_ms[activity_key] = now_ms
+                            interval_shards = self._ws_shard_last_event_ms.setdefault(activity_key, {})
                             interval_shards[shard_id] = now_ms
-                            self._ws_watchdog_alerted[interval] = False
-                            shard_alerted = self._ws_shard_watchdog_alerted.setdefault(interval, {})
+                            self._ws_watchdog_alerted[activity_key] = False
+                            shard_alerted = self._ws_shard_watchdog_alerted.setdefault(activity_key, {})
                             shard_alerted[shard_id] = False
                             if not _raw_has_closed_kline_marker(raw) and not _raw_maybe_control_frame(raw):
                                 fast_skipped_metric.inc()
@@ -630,7 +640,14 @@ class BinanceClient:
                 logger.warning("ws.reconnect interval=%s shard=%s error=%s", interval, shard_id, exc)
                 await asyncio.sleep(2.0)
 
-    async def _run_ws_watchdog(self, interval: str, expected_symbols: int, shard_ids: list[str]) -> None:
+    async def _run_ws_watchdog(
+        self,
+        interval: str,
+        expected_symbols: int,
+        shard_ids: list[str],
+        activity_key: str | None = None,
+    ) -> None:
+        activity_key = activity_key or interval
         interval_ms = self._interval_to_ms(interval)
         if interval_ms <= 0:
             logger.warning("ws.watchdog.disabled interval=%s reason=unknown_interval", interval)
@@ -641,8 +658,8 @@ class BinanceClient:
         while True:
             await asyncio.sleep(check_seconds)
             now_ms = int(time.time() * 1000)
-            shard_last = self._ws_shard_last_event_ms.get(interval, {})
-            shard_alerted = self._ws_shard_watchdog_alerted.setdefault(interval, {})
+            shard_last = self._ws_shard_last_event_ms.get(activity_key, {})
+            shard_alerted = self._ws_shard_watchdog_alerted.setdefault(activity_key, {})
             stale_shards = 0
             for shard_id in shard_ids:
                 last_ms = shard_last.get(shard_id, 0)
@@ -656,8 +673,9 @@ class BinanceClient:
                 self._ws_rebuild_generation[shard_id] = new_generation
                 shard_alerted[shard_id] = True
                 logger.error(
-                    "ws.watchdog.rebuild_shard interval=%s shard=%s no_data_ms=%s threshold_ms=%s periods=%s expected_symbols=%s total_shards=%s generation=%s",
+                    "ws.watchdog.rebuild_shard interval=%s stream=%s shard=%s no_data_ms=%s threshold_ms=%s periods=%s expected_symbols=%s total_shards=%s generation=%s",
                     interval,
+                    activity_key,
                     shard_id,
                     stale_ms,
                     stale_threshold_ms,
@@ -666,7 +684,7 @@ class BinanceClient:
                     len(shard_ids),
                     new_generation,
                 )
-            self._ws_watchdog_alerted[interval] = stale_shards > 0
+            self._ws_watchdog_alerted[activity_key] = stale_shards > 0
 
     def _interval_to_ms(self, interval: str) -> int:
         try:
@@ -693,7 +711,8 @@ class BinanceClient:
     def get_ws_shard_health_snapshot(self) -> dict[str, dict[str, int]]:
         now_ms = int(time.time() * 1000)
         out: dict[str, dict[str, int]] = {}
-        for interval, shard_map in self._ws_shard_last_event_ms.items():
+        for activity_key, shard_map in self._ws_shard_last_event_ms.items():
+            interval = self._ws_activity_interval.get(activity_key, activity_key.split(":", 1)[0])
             interval_ms = self._interval_to_ms(interval)
             no_data_periods = max(1, self._cfg.binance.ws_watchdog_no_data_periods)
             stale_threshold_ms = interval_ms * no_data_periods if interval_ms > 0 else 0
@@ -705,7 +724,7 @@ class BinanceClient:
                 worst_ago_ms = max(worst_ago_ms, ago_ms)
                 if stale_threshold_ms > 0 and ago_ms >= stale_threshold_ms:
                     stale += 1
-            out[interval] = {
+            out[activity_key] = {
                 "total_shards": total,
                 "stale_shards": stale,
                 "worst_shard_ago_ms": worst_ago_ms,

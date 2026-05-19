@@ -26,9 +26,11 @@ def create_app(config_path: str, service_mode: ServiceMode | None = None) -> Fas
     # FastAPI exposes /metrics itself; disable standalone prometheus HTTP listener.
     cfg.metrics.enabled = False
     setup_logging(cfg.log_level)
+    klines_interval = cfg.websocket.klines_interval.strip() or "1h"
+    klines_default_topic = cfg.websocket.klines_all_topic.strip() or f"klines.all.{klines_interval}"
 
     alerts_hub = FastAPIWsHub(name="alerts")
-    klines_hub = FastAPIWsHub(name="klines")
+    klines_hub = FastAPIWsHub(name="klines", default_topic=klines_default_topic)
     app_runtime = App(cfg, alerts_ws=alerts_hub, klines_ws=klines_hub)
     # Reuse existing replay behavior when new client connects.
     klines_hub._on_client_connected = app_runtime._on_klines_client_connected
@@ -71,6 +73,14 @@ def create_app(config_path: str, service_mode: ServiceMode | None = None) -> Fas
     @app.websocket("/ws/klines")
     async def ws_klines(ws: WebSocket) -> None:
         await klines_hub.connect(ws)
+        try:
+            await klines_hub.hold_until_disconnect(ws)
+        finally:
+            await klines_hub.disconnect(ws)
+
+    @app.websocket("/ws/klines/{topic}")
+    async def ws_klines_topic(ws: WebSocket, topic: str) -> None:
+        await klines_hub.connect(ws, topics=[topic])
         try:
             await klines_hub.hold_until_disconnect(ws)
         finally:

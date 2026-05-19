@@ -18,11 +18,13 @@ class WsBroadcaster:
         port: int,
         name: str,
         on_client_connected: Callable[[WebSocketServerProtocol], Awaitable[None]] | None = None,
+        default_topic: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._name = name
         self._on_client_connected = on_client_connected
+        self._default_topic = default_topic
         self._clients: set[WebSocketServerProtocol] = set()
         self._lock = asyncio.Lock()
 
@@ -47,7 +49,7 @@ class WsBroadcaster:
             logger.info("ws.listen name=%s host=%s port=%s", self._name, self._host, self._port)
             await stop.wait()
 
-    async def broadcast_json(self, payload: object) -> int:
+    async def broadcast_json(self, payload: object, topic: str | None = None) -> int:
         msg = orjson.dumps(payload).decode("utf-8")
         async with self._lock:
             clients: Iterable[WebSocketServerProtocol] = tuple(self._clients)
@@ -71,6 +73,9 @@ class WsBroadcaster:
                     self._clients.discard(c)
         return sent
 
-    async def client_count(self) -> int:
+    async def client_count(self, topic: str | None = None) -> int:
         async with self._lock:
             return len(self._clients)
+
+    async def topics_for(self, _ws: WebSocketServerProtocol) -> set[str]:
+        return {self._default_topic} if self._default_topic else set()

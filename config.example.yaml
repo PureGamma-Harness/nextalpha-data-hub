@@ -44,6 +44,16 @@ alerts:
   threshold_1h_pct: 25.0
   threshold_4h_pct: 40.0
   cooldown_seconds: 900
+  # 告警链路：重点币单独一条 1m Binance WSS，其他币保持原 1m 分片方式。
+  major_1m_enabled: true
+  # 复用告警链路的 1m K线，按 websocket.klines_major_1m_topic 推给 K线客户端。
+  publish_major_1m_klines: true
+  major_symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - XRPUSDT
 
 webhook:
   enabled: false
@@ -62,8 +72,21 @@ websocket:
   host: 0.0.0.0
   alerts_port: 8765
   klines_port: 8766
-  # 生产建议为 1h；压测/联调可临时改为 5m
+  # 全量市场推 1h；重点币 1h shard 会先推重点 topic，同时汇入全量聚合
   klines_interval: 1h
+  # 旧 /ws/klines 默认订阅这个 topic；也可用 /ws/klines/{topic} 或 ?topic= 指定
+  klines_all_topic: klines.all.1h
+  # true：重点币不再放进普通 1h 分片，改由独立 1h WSS 同时供重点 topic 和全量聚合使用
+  klines_major_symbols: [BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT]
+  klines_exclude_major_symbols: true
+  klines_major_1h_enabled: true
+  klines_major_1h_interval: 1h
+  klines_major_1h_topic: klines.majors.1h
+  # Kline 链路不再为 1m 单独订阅 Binance；klines.majors.1m 由 alert 侧 1m 摄取复用推送。
+  klines_major_1m_enabled: false
+  klines_major_1m_interval: 1m
+  klines_major_1m_topic: klines.majors.1m
+  klines_major_batch_max_wait_ms: 3000
   # false：同一收盘时刻服务端聚齐后整批一次下发；true：分片到达即推（多轮）
   klines_passthrough_mode: false
   # 分片内凑齐超时则先推送该分片已有数据（毫秒）；仅 passthrough 模式使用

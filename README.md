@@ -32,6 +32,8 @@ docker compose restart market-watcher-klines
 - 客户端接入（FastAPI WebSocket）：
   - 告警 WebSocket: `ws://<host>:8765/ws/alerts`
   - K线 WebSocket: `ws://<host>:8766/ws/klines`
+  - K线 topic 订阅：`ws://<host>:8766/ws/klines?topic=klines.majors.1h` 或 `ws://<host>:8766/ws/klines/klines.majors.1h`
+  - 重点币 1m K线 topic 由告警服务复用 1m 摄取推送：`ws://<host>:8765/ws/klines?topic=klines.majors.1m`
 
 线上启动示例：
 
@@ -70,20 +72,32 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 - **交易对集合**：启动时通过 Binance `exchangeInfo` 拉取全量 U 本位永续交易对（`PERPETUAL` + `USDT` + `TRADING`），并按周期定时刷新。
 - **告警链路**（`market-watcher-alerts`）：
   - 消费 `1m` 已收盘 K 线；
+  - `BTCUSDT/ETHUSDT/BNBUSDT/SOLUSDT/XRPUSDT` 使用告警专用的独立 `1m` Binance WSS，其他币继续按原 `1m` 分片消费；
+  - 重点币 `1m` K线会复用这条告警摄取链路，按 `klines.majors.1m` topic 组批推送，不再由 Kline 链路重复订阅 Binance；
   - 在 `1m/5m/1h/4h` 收盘边界计算涨跌幅并对比阈值；
   - 触发后同时：
     - 推送到 `ws://<host>:8765/ws/alerts`
     - 推送 Lark 告警通知（中文模板，含客户端连接数）。
 - **K 线链路**（`market-watcher-klines`）：
-  - 消费配置周期（当前联调常用 `5m`，生产可切 `1h`）的已收盘 K 线；
+  - 全量市场消费 `1h` 已收盘 K 线；
+  - `BTCUSDT/ETHUSDT/BNBUSDT/SOLUSDT/XRPUSDT` 从普通 `1h` 分片中剥离，使用一条独立 Binance WSS；该 WSS 到齐后先推重点币 `1h` topic，同时把数据汇入全量 `1h` 聚合；
+  - Kline 链路不再启动重点币 `1m` Binance WSS；`klines.majors.1m` 由告警链路产生；
   - 按 `close_time_ms` 做“全市场同一收盘时刻批次聚合”；生产默认 `websocket.klines_passthrough_mode: false`，服务端聚齐（或达放行策略）后**整批一次**下发；若改为 `true` 则为分片凑齐或超时后**多轮**直推。
-  - 推送到 `ws://<host>:8766/ws/klines`（单条消息为 `list[dict]` 批量）。
+  - 推送到 `ws://<host>:8766/ws/klines`（单条消息为 `list[dict]` 批量），每条 row 带 `topic` 字段。
+
+### K 线下游 Topics
+
+- `klines.all.1h`：默认 topic。全量 symbol 的 1h 批次，重点币 1h shard 和普通 1h 分片都会汇入该批次，满足发布条件后整批推送。
+- `klines.majors.1h`：重点币 `BTC/ETH/BNB/SOL/XRP` 的 1h 批次，使用一条独立 Binance WSS，到齐后直接推送，不等待全量 1h 聚合。
+- `klines.majors.1m`：重点币 `BTC/ETH/BNB/SOL/XRP` 的 1m 批次，复用 alert 侧 1m WSS 摄取后按原 topic 推送。
+- 可在连接后发送 `{"type":"subscribe","topics":["klines.majors.1h","klines.majors.1m"]}` 追加订阅；`set_topics` 替换订阅；`unsubscribe` 移除订阅。
 
 ### 2) WebSocket 分片与批次聚合
 
 - **分片规则**：
-  - 按 `websocket.klines_ws_batch_size` 将全量 symbol 分成多个 shard（例如 530 个币、batch_size=200 -> 3 个 shard）；
+  - 重点币 `1h` 单独一条 WSS，剩余 symbol 按 `websocket.klines_ws_batch_size` 继续分片（例如 530 个币、剥离 5 个重点币、batch_size=200 -> 1 条重点币 WSS + 3 条普通 shard）；
   - 每个 shard 建立一条 Binance 合并流连接，独立消费。
+  - 告警链路的重点币 `1m` 使用 `alerts.major_symbols` 建立单独一条 Binance 合并流连接；若为空则复用 `websocket.klines_major_symbols`。
 - **批次键**：`close_time_ms`
   - 各 shard 的同一收盘时刻数据会汇聚到同一个 `pending_by_close[close_time_ms]`；
   - 当满足发布条件后一次性广播该批次。
@@ -123,14 +137,10 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 ### 6) Lark 推送内容（当前）
 
 - **K线批次与ACK汇总**（单条合并消息）包含：
-  - 推送模式（聚合整批一次性下发 / 随到齐即一次性推送多轮统计）
-  - 收盘时间（格式化 `YYYY-MM-DD HH:MM:SS`）
-  - **收盘至推送完成**：`last_push_done_ms - close_time_ms`（`close_time_ms` 为 Binance 当根最后一毫秒；`last_push_done_ms` 为本批最后一次 WebSocket 写出；passthrough 多轮时取末轮）
-  - 推送数量/期望总数/缺失数量
-  - WS/REST 条数
-  - Binance到服务端、服务端整合耗时、服务端到客户端（不含ACK）、服务端到客户端（ACK）
-  - 每项统计均展示：`n`、`本次`、`avg`、`p95`、`min`、`max`
-  - K线客户端连接数、ACK上报客户端数、ACK已回执/期望总数
+  - Topic、收盘时间、数据源/模式、推送数量/缺失数量/客户端数
+  - 服务端链路：收盘边界到本地聚合完成、本地聚合完成到 WS 写出完成、收盘到 WS 写出完成
+  - 接收跨度、服务端到客户端（不含 ACK）、ACK 客户端数、接收/计算/下单 ACK 耗时
+  - 重点币 topic 会附带 `BTC/ETH/BNB/SOL/XRP` 的 1h 或 1m 单币耗时
 - **告警通知**包含：
   - 币种、周期、方向、上一根K线收盘价、当前对比K线收盘价、涨跌幅、触发阈值、告警客户端连接数。
 
@@ -148,7 +158,15 @@ WebSocket 推送消息中包含以下时间字段，方便客户端自行计算�
 为了模拟策略端接入（直连 WebSocket），项目提供了 `tests/smoke_downstream_client.py`：
 
 ```bash
-python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8766/ws/klines --klines-interval 1h
+python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8766/ws/klines --klines-interval 1h --ack-enabled
+```
+
+默认会订阅 `klines.all.1h`、`klines.majors.1h`，并按 row 的 `topic` 回传 ACK。
+
+重点币 1m topic 由 alert 服务复用告警摄取推送，可单独测：
+
+```bash
+python tests/smoke_downstream_client.py --ws-url ws://127.0.0.1:8765/ws/klines --topics klines.majors.1m --klines-interval 1m --ack-enabled
 ```
 
 完整说明见 `tests/README.md`。

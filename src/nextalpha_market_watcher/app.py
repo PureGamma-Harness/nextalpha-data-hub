@@ -49,8 +49,31 @@ class App:
         self._alerts_ws: object | None = alerts_ws
         self._klines_ws: object | None = klines_ws
         replay_maxlen = max(0, cfg.websocket.klines_replay_count)
-        self._klines_recent: deque[list[dict]] = deque(maxlen=replay_maxlen)
+        self._klines_recent_maxlen = replay_maxlen
+        self._klines_recent_by_topic: dict[str, deque[list[dict]]] = {}
         self._klines_recent_lock = asyncio.Lock()
+        self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
+        self._klines_all_topic = self._cfg.websocket.klines_all_topic.strip() or f"klines.all.{self._klines_interval}"
+        self._major_symbols = [s.strip().upper() for s in self._cfg.websocket.klines_major_symbols if s.strip()]
+        self._major_symbol_set = set(self._major_symbols)
+        self._exclude_major_symbols = bool(self._cfg.websocket.klines_exclude_major_symbols)
+        self._major_1h_enabled = bool(self._cfg.websocket.klines_major_1h_enabled)
+        self._major_1h_interval = self._cfg.websocket.klines_major_1h_interval.strip() or "1h"
+        self._major_1h_topic = self._cfg.websocket.klines_major_1h_topic.strip() or "klines.majors.1h"
+        self._major_1m_interval = self._cfg.websocket.klines_major_1m_interval.strip() or "1m"
+        self._major_1m_topic = self._cfg.websocket.klines_major_1m_topic.strip() or "klines.majors.1m"
+        self._major_1m_enabled = bool(self._cfg.websocket.klines_major_1m_enabled)
+        self._klines_stream_key = self._klines_interval
+        self._major_1h_stream_key = f"{self._major_1h_interval}:{self._major_1h_topic}"
+        self._major_1m_stream_key = f"{self._major_1m_interval}:{self._major_1m_topic}"
+        alert_major_symbols = self._cfg.alerts.major_symbols or self._cfg.websocket.klines_major_symbols
+        self._alert_major_symbols = [s.strip().upper() for s in alert_major_symbols if s.strip()]
+        self._alert_major_symbol_set = set(self._alert_major_symbols)
+        self._alert_major_1m_enabled = bool(self._cfg.alerts.major_1m_enabled)
+        self._alert_publish_major_1m_klines = bool(self._cfg.alerts.publish_major_1m_klines)
+        self._alert_1m_stream_key = "alerts.1m"
+        self._alert_major_1m_stream_key = "alerts.1m:majors"
+        self._major_batch_max_wait_ms = max(50, self._cfg.websocket.klines_major_batch_max_wait_ms)
         if self._alerts_ws is None and cfg.service_mode in ("alerts", "all"):
             self._alerts_ws = WsBroadcaster(cfg.websocket.host, cfg.websocket.alerts_port, name="alerts")
         if self._klines_ws is None and cfg.service_mode in ("klines", "all"):
@@ -59,6 +82,7 @@ class App:
                 cfg.websocket.klines_port,
                 name="klines",
                 on_client_connected=self._on_klines_client_connected,
+                default_topic=self._klines_all_topic,
             )
         self._ingest_1m = 0
         self._ingest_1h = 0
@@ -77,41 +101,49 @@ class App:
         self._full_batch_max_wait_ms = max(1_000, self._cfg.websocket.klines_full_batch_max_wait_ms)
         self._max_missing_symbols = max(0, self._cfg.websocket.klines_max_missing_symbols)
         self._pending_lock = asyncio.Lock()
-        self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
         self._klines_ws_batch_size = max(1, self._cfg.websocket.klines_ws_batch_size)
         self._klines_passthrough_mode = bool(self._cfg.websocket.klines_passthrough_mode)
         self._rest_repair_delay_ms = self._resolve_rest_repair_delay_ms(self._klines_interval)
         self._rest_repairing_close_times: set[int] = set()
         self._log_full_missing_symbols = self._cfg.websocket.klines_log_full_missing_symbols
-        self._pending_latency: dict[str, LatencyEvent] = {}
+        self._pending_latency: dict[tuple[str, str], LatencyEvent] = {}
         self._pending_latency_lock = asyncio.Lock()
         self._latency_redis = redis.from_url(cfg.redis.url, decode_responses=True)
-        self._event_close_time: dict[str, int] = {}
-        self._ack_service_to_downstream_by_close: dict[int, list[int]] = {}
-        self._ack_ingest_to_downstream_by_close: dict[int, list[int]] = {}
-        self._batch_done_to_ack_by_close: dict[int, list[int]] = {}
-        self._batch_done_to_integrated_ack_by_close: dict[int, list[int]] = {}
-        self._batch_done_to_compute_ack_by_close: dict[int, list[int]] = {}
-        self._batch_done_to_order_ack_by_close: dict[int, list[int]] = {}
-        self._ack_expected_by_close: dict[int, int] = {}
-        self._ack_clients_by_close: dict[int, set[int]] = {}
-        self._batch_ack_clients_by_close: dict[int, set[int]] = {}
-        self._batch_integrated_ack_clients_by_close: dict[int, set[int]] = {}
-        self._batch_compute_ack_clients_by_close: dict[int, set[int]] = {}
-        self._batch_order_ack_clients_by_close: dict[int, set[int]] = {}
-        self._ack_notify_scheduled: set[int] = set()
-        self._batch_summary_by_close: dict[int, dict[str, str | int]] = {}
-        self._batch_metric_values_by_close: dict[int, dict[str, int | list[int]]] = {}
+        self._event_close_time: dict[tuple[str, str], tuple[str, int]] = {}
+        self._ack_service_to_downstream_by_close: dict[tuple[str, int], list[int]] = {}
+        self._ack_ingest_to_downstream_by_close: dict[tuple[str, int], list[int]] = {}
+        self._batch_done_to_ack_by_close: dict[tuple[str, int], list[int]] = {}
+        self._batch_done_to_integrated_ack_by_close: dict[tuple[str, int], list[int]] = {}
+        self._batch_done_to_compute_ack_by_close: dict[tuple[str, int], list[int]] = {}
+        self._batch_done_to_order_ack_by_close: dict[tuple[str, int], list[int]] = {}
+        self._ack_expected_by_close: dict[tuple[str, int], int] = {}
+        self._ack_clients_by_close: dict[tuple[str, int], set[int]] = {}
+        self._batch_ack_clients_by_close: dict[tuple[str, int], set[int]] = {}
+        self._batch_integrated_ack_clients_by_close: dict[tuple[str, int], set[int]] = {}
+        self._batch_compute_ack_clients_by_close: dict[tuple[str, int], set[int]] = {}
+        self._batch_order_ack_clients_by_close: dict[tuple[str, int], set[int]] = {}
+        self._ack_notify_scheduled: set[tuple[str, int]] = set()
+        self._batch_summary_by_close: dict[tuple[str, int], dict[str, str | int]] = {}
+        self._batch_metric_values_by_close: dict[tuple[str, int], dict[str, int | list[int] | dict | str]] = {}
         self._passthrough_shards_sent_by_close: dict[int, set[str]] = {}
         self._passthrough_total_shards_by_close: dict[int, int] = {}
-        self._batch_done_publish_ms_by_close: dict[int, int] = {}
-        self._publish_queue: asyncio.Queue[tuple[int, dict[str, dict], int | None]] = asyncio.Queue(maxsize=4096)
+        self._batch_done_publish_ms_by_close: dict[tuple[str, int], int] = {}
+        self._publish_queue: asyncio.Queue[tuple[str, int, dict[str, dict], int | None, bool, bool]] = asyncio.Queue(
+            maxsize=4096,
+        )
         self._latency_write_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=200_000)
         self._passthrough_shard_lock = asyncio.Lock()
         self._passthrough_shard_buffers: dict[tuple[int, str], dict[str, dict]] = {}
         # [expected_symbol_count, first_wall_ms, min_ingest_ms]
         self._passthrough_shard_meta: dict[tuple[int, str], list[int]] = {}
         self._passthrough_shard_max_wait_ms = max(50, self._cfg.websocket.klines_passthrough_shard_max_wait_ms)
+        self._major_pending_lock = asyncio.Lock()
+        self._major_pending_by_close: dict[tuple[str, int], dict[str, dict]] = {}
+        self._major_pending_first_ingest_ms: dict[tuple[str, int], int] = {}
+        self._major_expected_symbols_by_topic: dict[str, set[str]] = {}
+        self._major_published_close_times: set[tuple[str, int]] = set()
+        self._major_published_close_order: deque[tuple[str, int]] = deque()
+        self._major_published_close_max = 64
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop_event = stop if stop is not None else asyncio.Event()
@@ -126,6 +158,7 @@ class App:
         refresh_task: asyncio.Task[None] | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         stale_flush_task: asyncio.Task[None] | None = None
+        major_stale_flush_task: asyncio.Task[None] | None = None
         passthrough_flush_task: asyncio.Task[None] | None = None
         publish_worker_task: asyncio.Task[None] | None = None
         latency_writer_task: asyncio.Task[None] | None = None
@@ -144,6 +177,8 @@ class App:
             latency_writer_task = asyncio.create_task(self._run_latency_writer(stop_event))
             if self._cfg.service_mode in ("klines", "all") and not self._klines_passthrough_mode:
                 stale_flush_task = asyncio.create_task(self._run_klines_stale_flush(stop_event))
+            if self._should_run_any_dedicated_major() or self._should_publish_alert_major_1m_klines():
+                major_stale_flush_task = asyncio.create_task(self._run_major_stale_flush(stop_event))
             if self._cfg.service_mode in ("klines", "all") and self._klines_passthrough_mode:
                 passthrough_flush_task = asyncio.create_task(self._run_passthrough_shard_flush(stop_event))
             stop_wait = asyncio.create_task(stop_event.wait())
@@ -168,6 +203,8 @@ class App:
                         await asyncio.gather(heartbeat_task, return_exceptions=True)
                     if stale_flush_task:
                         await asyncio.gather(stale_flush_task, return_exceptions=True)
+                    if major_stale_flush_task:
+                        await asyncio.gather(major_stale_flush_task, return_exceptions=True)
                     if passthrough_flush_task:
                         await asyncio.gather(passthrough_flush_task, return_exceptions=True)
                     if publish_worker_task:
@@ -207,6 +244,7 @@ class App:
                 refresh_task,
                 heartbeat_task,
                 stale_flush_task,
+                major_stale_flush_task,
                 passthrough_flush_task,
                 publish_worker_task,
                 latency_writer_task,
@@ -224,11 +262,91 @@ class App:
     async def _run_ingestion(self, symbols: list[str]) -> None:
         tasks: list[asyncio.Task[None]] = []
         if self._cfg.service_mode in ("klines", "all"):
-            tasks.append(asyncio.create_task(self._run_1h_publish(symbols)))
+            await self._reset_full_klines_batch_state(symbols)
+            primary_symbols = self._primary_klines_symbols(symbols)
+            if primary_symbols:
+                tasks.append(asyncio.create_task(self._run_1h_publish(primary_symbols)))
+            else:
+                logger.warning("klines.primary.disabled reason=no_matching_symbols")
+            major_symbols = self._available_major_symbols(symbols)
+            if self._major_symbol_set and not major_symbols:
+                logger.warning("klines.major.disabled reason=no_matching_symbols")
+            if major_symbols and self._should_run_dedicated_major_1h():
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_major_interval_publish(
+                            major_symbols,
+                            interval=self._major_1h_interval,
+                            topic=self._major_1h_topic,
+                            stream_key=self._major_1h_stream_key,
+                            mirror_to_all_topic=self._major_1h_interval == self._klines_interval,
+                        ),
+                    ),
+                )
+            if major_symbols and self._should_run_dedicated_major_1m():
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_major_interval_publish(
+                            major_symbols,
+                            interval=self._major_1m_interval,
+                            topic=self._major_1m_topic,
+                            stream_key=self._major_1m_stream_key,
+                        ),
+                    ),
+                )
         if self._cfg.service_mode in ("alerts", "all"):
             if self._alerts is None:
                 raise RuntimeError("alerts ingestion requires service_mode alerts or all")
-            tasks.append(asyncio.create_task(self._run_1m_alerts(symbols)))
+            publish_major_1m_topic = self._major_1m_topic if self._should_publish_alert_major_1m_klines() else None
+            if self._should_run_dedicated_alert_major_1m():
+                alert_major_symbols = self._available_alert_major_symbols(symbols)
+                if alert_major_symbols:
+                    if publish_major_1m_topic:
+                        self._major_expected_symbols_by_topic[publish_major_1m_topic] = set(alert_major_symbols)
+                    alert_primary_symbols = self._primary_alert_symbols(symbols)
+                    if alert_primary_symbols:
+                        tasks.append(
+                            asyncio.create_task(
+                                self._run_1m_alerts(
+                                    alert_primary_symbols,
+                                    stream_key=self._alert_1m_stream_key,
+                                ),
+                            ),
+                        )
+                    else:
+                        logger.warning("alerts.primary.disabled reason=no_matching_symbols")
+                    tasks.append(
+                        asyncio.create_task(
+                            self._run_1m_alerts(
+                                alert_major_symbols,
+                                batch_size=max(1, len(alert_major_symbols)),
+                                stream_key=self._alert_major_1m_stream_key,
+                                publish_kline_topic=publish_major_1m_topic,
+                                publish_kline_symbols=set(alert_major_symbols),
+                            ),
+                        ),
+                    )
+                else:
+                    logger.warning("alerts.major.disabled reason=no_matching_symbols")
+                    tasks.append(
+                        asyncio.create_task(
+                            self._run_1m_alerts(symbols, stream_key=self._alert_1m_stream_key),
+                        ),
+                    )
+            else:
+                alert_major_symbols = self._available_alert_major_symbols(symbols) if publish_major_1m_topic else []
+                if publish_major_1m_topic and alert_major_symbols:
+                    self._major_expected_symbols_by_topic[publish_major_1m_topic] = set(alert_major_symbols)
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_1m_alerts(
+                            symbols,
+                            stream_key=self._alert_1m_stream_key,
+                            publish_kline_topic=publish_major_1m_topic,
+                            publish_kline_symbols=set(alert_major_symbols),
+                        ),
+                    ),
+                )
         if not tasks:
             raise RuntimeError(f"No ingestion tasks for service_mode={self._cfg.service_mode}")
 
@@ -247,7 +365,101 @@ class App:
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _passthrough_row_dict(self, kline: ClosedKline) -> dict:
+    def _primary_klines_symbols(self, symbols: list[str]) -> list[str]:
+        if not self._exclude_major_symbols or not self._major_symbol_set:
+            return symbols
+        if not self._should_run_dedicated_major_1h() or self._major_1h_interval != self._klines_interval:
+            return symbols
+        filtered = [symbol for symbol in symbols if symbol not in self._major_symbol_set]
+        logger.info(
+            "klines.primary.symbols selected=%s dedicated_major_shard=%s",
+            len(filtered),
+            len(symbols) - len(filtered),
+        )
+        return filtered
+
+    def _available_major_symbols(self, symbols: list[str]) -> list[str]:
+        available_symbols = set(symbols)
+        major_symbols = [s for s in self._major_symbols if s in available_symbols]
+        missing_major = sorted(self._major_symbol_set - set(major_symbols))
+        if missing_major:
+            logger.warning("klines.major.symbols_missing symbols=%s", ",".join(missing_major))
+        return major_symbols
+
+    def _primary_alert_symbols(self, symbols: list[str]) -> list[str]:
+        if not self._should_run_dedicated_alert_major_1m():
+            return symbols
+        filtered = [symbol for symbol in symbols if symbol not in self._alert_major_symbol_set]
+        logger.info(
+            "alerts.primary.symbols selected=%s dedicated_major_shard=%s",
+            len(filtered),
+            len(symbols) - len(filtered),
+        )
+        return filtered
+
+    def _available_alert_major_symbols(self, symbols: list[str]) -> list[str]:
+        available_symbols = set(symbols)
+        major_symbols = [s for s in self._alert_major_symbols if s in available_symbols]
+        missing_major = sorted(self._alert_major_symbol_set - set(major_symbols))
+        if missing_major:
+            logger.warning("alerts.major.symbols_missing symbols=%s", ",".join(missing_major))
+        return major_symbols
+
+    def _should_run_any_dedicated_major(self) -> bool:
+        return self._should_run_dedicated_major_1h() or self._should_run_dedicated_major_1m()
+
+    def _should_run_dedicated_major_1h(self) -> bool:
+        return (
+            self._cfg.service_mode in ("klines", "all")
+            and self._major_1h_enabled
+            and bool(self._major_symbol_set)
+        )
+
+    def _should_run_dedicated_major_1m(self) -> bool:
+        return (
+            self._cfg.service_mode in ("klines", "all")
+            and self._major_1m_enabled
+            and bool(self._major_symbol_set)
+        )
+
+    def _should_run_dedicated_alert_major_1m(self) -> bool:
+        return (
+            self._cfg.service_mode in ("alerts", "all")
+            and self._alert_major_1m_enabled
+            and bool(self._alert_major_symbol_set)
+        )
+
+    def _should_publish_alert_major_1m_klines(self) -> bool:
+        return (
+            self._cfg.service_mode in ("alerts", "all")
+            and self._alert_publish_major_1m_klines
+            and bool(self._alert_major_symbol_set)
+            and bool(self._major_1m_topic)
+            and not (self._cfg.service_mode == "all" and self._major_1m_enabled)
+        )
+
+    async def _reset_full_klines_batch_state(self, symbols: list[str]) -> None:
+        async with self._pending_lock:
+            self._expected_symbols = set(symbols)
+            self._pending_by_close.clear()
+            self._pending_has_ws.clear()
+            self._pending_first_ingest_ms.clear()
+            self._published_close_times.clear()
+            self._published_close_order.clear()
+            self._rest_repairing_close_times.clear()
+        async with self._passthrough_shard_lock:
+            self._passthrough_shard_buffers.clear()
+            self._passthrough_shard_meta.clear()
+            self._passthrough_shards_sent_by_close.clear()
+            self._passthrough_total_shards_by_close.clear()
+
+    def _full_batch_min_required(self) -> int:
+        expected_symbols = len(self._expected_symbols)
+        if self._full_batch_only:
+            return max(1, expected_symbols)
+        return max(1, math.ceil(expected_symbols * self._min_publish_ratio))
+
+    def _kline_row_dict(self, kline: ClosedKline) -> dict:
         return {
             "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
             "symbol": kline.symbol,
@@ -268,6 +480,9 @@ class App:
             "ws_shard_symbol_count": kline.ws_shard_symbol_count,
             "ws_total_shards": kline.ws_total_shards,
         }
+
+    def _passthrough_row_dict(self, kline: ClosedKline) -> dict:
+        return self._kline_row_dict(kline)
 
     async def _passthrough_buffer_add(self, kline: ClosedKline) -> None:
         row = self._passthrough_row_dict(kline)
@@ -315,71 +530,27 @@ class App:
 
     async def _run_1h_publish(self, symbols: list[str]) -> None:
         if self._klines_ws is None:
-            async for _ in self._binance.iter_closed_klines(symbols, interval=self._klines_interval):
+            async for _ in self._binance.iter_closed_klines(
+                symbols,
+                interval=self._klines_interval,
+                stream_key=self._klines_stream_key,
+            ):
                 self._ingest_1h += 1
             return
 
-        self._expected_symbols = set(symbols)
-        expected_symbols = len(self._expected_symbols)
-        # In full-batch mode, always prefer full batch for immediate publish.
-        # Tolerant (missing <= N) publish is handled by max-wait path.
-        if self._full_batch_only:
-            min_required = max(1, expected_symbols)
-        else:
-            min_required = max(1, math.ceil(expected_symbols * self._min_publish_ratio))
-        self._pending_by_close.clear()
-        self._pending_has_ws.clear()
-        self._pending_first_ingest_ms.clear()
-        self._published_close_times.clear()
-        self._published_close_order.clear()
         latest_close_by_symbol: dict[str, int] = {}
-
         async for kline in self._binance.iter_closed_klines(
             symbols,
             interval=self._klines_interval,
             batch_size=self._klines_ws_batch_size,
+            stream_key=self._klines_stream_key,
         ):
             prev_close = latest_close_by_symbol.get(kline.symbol)
             if prev_close is not None and kline.close_time_ms <= prev_close:
                 continue
             latest_close_by_symbol[kline.symbol] = kline.close_time_ms
             self._ingest_1h += 1
-            if self._klines_passthrough_mode:
-                await self._passthrough_buffer_add(kline)
-                continue
-            complete_rows: dict[str, dict] | None = None
-            async with self._pending_lock:
-                if kline.close_time_ms in self._published_close_times:
-                    continue
-                rows_by_symbol = self._pending_by_close.setdefault(kline.close_time_ms, {})
-                self._pending_first_ingest_ms.setdefault(kline.close_time_ms, kline.ingest_time_ms)
-                rows_by_symbol[kline.symbol] = {
-                    "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
-                    "symbol": kline.symbol,
-                    "interval": kline.interval,
-                    "open_time_ms": kline.open_time_ms,
-                    "close_time_ms": kline.close_time_ms,
-                    "open": str(kline.open_price),
-                    "high": str(kline.high_price),
-                    "low": str(kline.low_price),
-                    "close": str(kline.close_price),
-                    "volume": str(kline.volume),
-                    "quote_volume": str(kline.quote_volume),
-                    "exchange_event_ms": kline.event_time_ms,
-                    "service_ingest_ms": kline.ingest_time_ms,
-                    "service_region": self._cfg.service_region,
-                    "source": kline.source,
-                }
-                if kline.source == "ws":
-                    self._pending_has_ws[kline.close_time_ms] = True
-                if len(rows_by_symbol) >= min_required:
-                    complete_rows = self._pending_by_close.pop(kline.close_time_ms, {})
-                    self._pending_has_ws.pop(kline.close_time_ms, None)
-                    first_ingest_ms = self._pending_first_ingest_ms.pop(kline.close_time_ms, None)
-                    self._mark_close_time_published_locked(kline.close_time_ms)
-
-            if complete_rows:
-                await self._enqueue_publish(close_time_ms=kline.close_time_ms, rows_by_symbol=complete_rows, first_ingest_ms=first_ingest_ms)
+            await self._add_full_topic_kline(kline)
 
         async with self._pending_lock:
             pending_items = sorted(self._pending_by_close.items())
@@ -406,25 +577,59 @@ class App:
                 first_ingest_ms=pending_first.get(close_time_ms),
             )
 
+    async def _add_full_topic_kline(self, kline: ClosedKline) -> None:
+        if self._klines_ws is None:
+            return
+        if self._klines_passthrough_mode:
+            await self._passthrough_buffer_add(kline)
+            return
+
+        complete_rows: dict[str, dict] | None = None
+        first_ingest_ms: int | None = None
+        min_required = self._full_batch_min_required()
+        async with self._pending_lock:
+            if kline.close_time_ms in self._published_close_times:
+                return
+            rows_by_symbol = self._pending_by_close.setdefault(kline.close_time_ms, {})
+            self._pending_first_ingest_ms.setdefault(kline.close_time_ms, kline.ingest_time_ms)
+            rows_by_symbol[kline.symbol] = self._kline_row_dict(kline)
+            if kline.source == "ws":
+                self._pending_has_ws[kline.close_time_ms] = True
+            if len(rows_by_symbol) >= min_required:
+                complete_rows = self._pending_by_close.pop(kline.close_time_ms, {})
+                self._pending_has_ws.pop(kline.close_time_ms, None)
+                first_ingest_ms = self._pending_first_ingest_ms.pop(kline.close_time_ms, None)
+                self._mark_close_time_published_locked(kline.close_time_ms)
+
+        if complete_rows:
+            await self._enqueue_publish(
+                close_time_ms=kline.close_time_ms,
+                rows_by_symbol=complete_rows,
+                first_ingest_ms=first_ingest_ms,
+            )
+
     async def _flush_close_time(
         self,
+        topic: str,
         close_time_ms: int,
         rows_by_symbol: dict[str, dict],
         first_ingest_ms: int | None = None,
+        notify_summary: bool = True,
+        track_latency: bool = True,
+        publish_derived: bool = True,
     ) -> None:
         if not rows_by_symbol or self._klines_ws is None:
             return
         publish_ms = int(time.time() * 1000)
-        payload = [dict(row, service_publish_ms=publish_ms) for row in rows_by_symbol.values()]
+        payload = [dict(row, service_publish_ms=publish_ms, topic=topic) for row in rows_by_symbol.values()]
         payload.sort(key=lambda row: row["symbol"])
-        await self._record_published_latency_state(payload)
-        if self._klines_recent.maxlen and self._klines_recent.maxlen > 0:
-            async with self._klines_recent_lock:
-                self._klines_recent.append(payload)
+        if track_latency:
+            await self._record_published_latency_state(payload, topic, send_ack_summary=notify_summary)
+        await self._remember_recent_payload(topic, payload)
         batch_done = False
         batch_sent_shards = 0
         batch_total_shards = 0
-        if self._klines_passthrough_mode and payload:
+        if topic == self._klines_all_topic and self._klines_passthrough_mode and payload:
             shard_id = str(payload[0].get("ws_shard_id") or "")
             if shard_id:
                 total_from_payload = int(payload[0].get("ws_total_shards") or 0)
@@ -452,25 +657,31 @@ class App:
         batch_push_done_ms = int(time.time() * 1000)
         for row in payload:
             row["batch_push_done_ms"] = batch_push_done_ms
-        pushed_clients = await self._klines_ws.broadcast_json(payload)
-        self._enqueue_latency_events(self._build_published_latency_events(payload))
+        pushed_clients = await self._klines_ws.broadcast_json(payload, topic=topic)
+        if track_latency:
+            self._enqueue_latency_events(self._build_published_latency_events(payload, topic))
         push_done_ms = int(time.time() * 1000)
         if batch_done:
-            self._batch_done_publish_ms_by_close[close_time_ms] = batch_push_done_ms
+            self._batch_done_publish_ms_by_close[(topic, close_time_ms)] = batch_push_done_ms
         service_to_client_no_ack_ms = max(0, push_done_ms - publish_ms)
         if pushed_clients > 0:
             self._push_1h += pushed_clients * len(payload)
         got_symbols = len(rows_by_symbol)
-        if self._klines_passthrough_mode:
-            expected_symbols = self._ack_expected_by_close.get(close_time_ms, got_symbols)
+        expected_symbol_set: set[str] | None = None
+        if topic == self._klines_all_topic:
+            expected_symbol_set = self._expected_symbols
+        elif topic in (self._major_1h_topic, self._major_1m_topic):
+            expected_symbol_set = self._major_expected_symbols_by_topic.get(topic, self._major_symbol_set)
+        if topic == self._klines_all_topic and self._klines_passthrough_mode:
+            expected_symbols = self._ack_expected_by_close.get((topic, close_time_ms), got_symbols)
             missing_symbols = 0
             got_ratio = 1.0
             missing_list: list[str] = []
         else:
-            expected_symbols = len(self._expected_symbols)
+            expected_symbols = len(expected_symbol_set) if expected_symbol_set is not None else got_symbols
             missing_symbols = expected_symbols - got_symbols
             got_ratio = (got_symbols / expected_symbols) if expected_symbols > 0 else 0.0
-            missing_list = sorted(self._expected_symbols - set(rows_by_symbol.keys()))
+            missing_list = sorted((expected_symbol_set or set()) - set(rows_by_symbol.keys()))
         missing_sample = ",".join(missing_list[:20]) if missing_list else "-"
         ws_count = sum(1 for row in payload if row.get("source") == "ws")
         rest_count = len(payload) - ws_count
@@ -482,7 +693,8 @@ class App:
             math.ceil(expected_symbols * self._min_publish_ratio),
         )
         logger.info(
-            "klines.batch.published close_time_ms=%s batch_size=%s got_symbols=%s expected_symbols=%s got_ratio=%.3f ws_count=%s rest_count=%s min_required=%s missing_symbols=%s missing_sample=%s full_batch_wait_ms=%s full_batch_only=%s min_publish_ratio=%.3f pushed_clients=%s pushed_rows_total=%s",
+            "klines.batch.published topic=%s close_time_ms=%s batch_size=%s got_symbols=%s expected_symbols=%s got_ratio=%.3f ws_count=%s rest_count=%s min_required=%s missing_symbols=%s missing_sample=%s full_batch_wait_ms=%s full_batch_only=%s min_publish_ratio=%.3f pushed_clients=%s pushed_rows_total=%s",
+            topic,
             close_time_ms,
             len(payload),
             got_symbols,
@@ -499,24 +711,199 @@ class App:
             pushed_clients,
             self._push_1h,
         )
-        if self._log_full_missing_symbols and missing_list:
+        if notify_summary and self._log_full_missing_symbols and missing_list:
             logger.info(
-                "klines.batch.missing_full close_time_ms=%s missing_symbols=%s missing_list=%s",
+                "klines.batch.missing_full topic=%s close_time_ms=%s missing_symbols=%s missing_list=%s",
+                topic,
                 close_time_ms,
                 len(missing_list),
                 ",".join(missing_list),
             )
-        await self._notify_kline_batch(
-            payload,
-            expected_symbols,
-            missing_symbols,
-            ws_count,
-            rest_count,
-            service_to_client_no_ack_ms,
-            pushed_clients,
-            publish_ms,
-            push_done_ms,
-        )
+        if notify_summary:
+            await self._notify_kline_batch(
+                payload,
+                topic,
+                expected_symbols,
+                missing_symbols,
+                ws_count,
+                rest_count,
+                service_to_client_no_ack_ms,
+                pushed_clients,
+                publish_ms,
+                push_done_ms,
+            )
+        if publish_derived and topic == self._klines_all_topic:
+            await self._publish_derived_major_topics(close_time_ms, rows_by_symbol, first_ingest_ms)
+
+    async def _publish_derived_major_topics(
+        self,
+        close_time_ms: int,
+        rows_by_symbol: dict[str, dict],
+        first_ingest_ms: int | None,
+    ) -> None:
+        if not self._major_symbol_set:
+            return
+        major_rows = {symbol: rows_by_symbol[symbol] for symbol in self._major_symbols if symbol in rows_by_symbol}
+        if not major_rows:
+            return
+        if self._klines_interval == self._major_1h_interval and not self._should_run_dedicated_major_1h():
+            await self._flush_close_time(
+                self._major_1h_topic,
+                close_time_ms,
+                major_rows,
+                first_ingest_ms,
+                notify_summary=True,
+                track_latency=True,
+                publish_derived=False,
+            )
+        if (
+            self._major_1m_enabled
+            and self._klines_interval == self._major_1m_interval
+            and not self._should_run_dedicated_major_1m()
+        ):
+            await self._flush_close_time(
+                self._major_1m_topic,
+                close_time_ms,
+                major_rows,
+                first_ingest_ms,
+                notify_summary=True,
+                track_latency=True,
+                publish_derived=False,
+            )
+
+    async def _run_major_interval_publish(
+        self,
+        symbols: list[str],
+        interval: str,
+        topic: str,
+        stream_key: str | None = None,
+        mirror_to_all_topic: bool = False,
+    ) -> None:
+        expected_symbols = set(symbols)
+        self._major_expected_symbols_by_topic[topic] = expected_symbols
+        if self._klines_ws is None:
+            async for _ in self._binance.iter_closed_klines(
+                symbols,
+                interval=interval,
+                batch_size=max(1, len(symbols)),
+                stream_key=stream_key,
+            ):
+                self._ingest_1h += 1
+            return
+
+        latest_close_by_symbol: dict[str, int] = {}
+        async for kline in self._binance.iter_closed_klines(
+            symbols,
+            interval=interval,
+            batch_size=max(1, len(symbols)),
+            stream_key=stream_key,
+        ):
+            prev_close = latest_close_by_symbol.get(kline.symbol)
+            if prev_close is not None and kline.close_time_ms <= prev_close:
+                continue
+            latest_close_by_symbol[kline.symbol] = kline.close_time_ms
+            self._ingest_1h += 1
+            complete_rows: dict[str, dict] | None = None
+            first_ingest_ms: int | None = None
+            batch_key = (topic, kline.close_time_ms)
+            async with self._major_pending_lock:
+                if batch_key not in self._major_published_close_times:
+                    rows_by_symbol = self._major_pending_by_close.setdefault(batch_key, {})
+                    self._major_pending_first_ingest_ms.setdefault(batch_key, kline.ingest_time_ms)
+                    rows_by_symbol[kline.symbol] = self._kline_row_dict(kline)
+                    if len(rows_by_symbol) >= len(expected_symbols):
+                        complete_rows = self._major_pending_by_close.pop(batch_key, {})
+                        first_ingest_ms = self._major_pending_first_ingest_ms.pop(batch_key, None)
+                        self._mark_major_close_time_published_locked(topic, kline.close_time_ms)
+
+            if complete_rows:
+                await self._enqueue_topic_publish(
+                    topic,
+                    kline.close_time_ms,
+                    complete_rows,
+                    first_ingest_ms,
+                    notify_summary=True,
+                    track_latency=True,
+                )
+            if mirror_to_all_topic:
+                await self._add_full_topic_kline(kline)
+
+    async def _add_major_topic_kline(
+        self,
+        kline: ClosedKline,
+        topic: str,
+        expected_symbols: set[str],
+    ) -> None:
+        if self._klines_ws is None or not topic or not expected_symbols:
+            return
+        self._major_expected_symbols_by_topic[topic] = expected_symbols
+        complete_rows: dict[str, dict] | None = None
+        first_ingest_ms: int | None = None
+        batch_key = (topic, kline.close_time_ms)
+        async with self._major_pending_lock:
+            if batch_key in self._major_published_close_times:
+                return
+            rows_by_symbol = self._major_pending_by_close.setdefault(batch_key, {})
+            self._major_pending_first_ingest_ms.setdefault(batch_key, kline.ingest_time_ms)
+            rows_by_symbol[kline.symbol] = self._kline_row_dict(kline)
+            if len(rows_by_symbol) >= len(expected_symbols):
+                complete_rows = self._major_pending_by_close.pop(batch_key, {})
+                first_ingest_ms = self._major_pending_first_ingest_ms.pop(batch_key, None)
+                self._mark_major_close_time_published_locked(topic, kline.close_time_ms)
+
+        if complete_rows:
+            await self._enqueue_topic_publish(
+                topic,
+                kline.close_time_ms,
+                complete_rows,
+                first_ingest_ms,
+                notify_summary=True,
+                track_latency=True,
+            )
+
+    async def _run_major_stale_flush(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(0.5)
+            now_ms = int(time.time() * 1000)
+            flush_items: list[tuple[str, int, dict[str, dict], int | None]] = []
+            async with self._major_pending_lock:
+                candidate_keys: list[tuple[str, int]] = []
+                for batch_key, rows_by_symbol in self._major_pending_by_close.items():
+                    if not rows_by_symbol:
+                        continue
+                    first_ingest_ms = self._major_pending_first_ingest_ms.get(batch_key)
+                    if first_ingest_ms is None:
+                        continue
+                    if now_ms - first_ingest_ms >= self._major_batch_max_wait_ms:
+                        candidate_keys.append(batch_key)
+                for batch_key in sorted(candidate_keys):
+                    topic, close_time_ms = batch_key
+                    rows_by_symbol = self._major_pending_by_close.pop(batch_key, {})
+                    first_ingest_ms = self._major_pending_first_ingest_ms.pop(batch_key, None)
+                    if rows_by_symbol:
+                        self._mark_major_close_time_published_locked(topic, close_time_ms)
+                        flush_items.append((topic, close_time_ms, rows_by_symbol, first_ingest_ms))
+
+            for topic, close_time_ms, rows_by_symbol, first_ingest_ms in flush_items:
+                expected_symbol_set = self._major_expected_symbols_by_topic.get(topic, self._major_symbol_set)
+                missing = sorted(expected_symbol_set - set(rows_by_symbol.keys()))
+                logger.warning(
+                    "klines.major.batch.timeout_flush topic=%s close_time_ms=%s got=%s expected=%s missing=%s max_wait_ms=%s",
+                    topic,
+                    close_time_ms,
+                    len(rows_by_symbol),
+                    len(expected_symbol_set),
+                    ",".join(missing) if missing else "-",
+                    self._major_batch_max_wait_ms,
+                )
+                await self._enqueue_topic_publish(
+                    topic,
+                    close_time_ms,
+                    rows_by_symbol,
+                    first_ingest_ms,
+                    notify_summary=True,
+                    track_latency=True,
+                )
 
     async def _flush_stale_batches(self, now_ms: int) -> None:
         if self._klines_ws is None:
@@ -691,23 +1078,7 @@ class App:
                     rows_now = self._pending_by_close.get(close_time_ms)
                     if rows_now is None or symbol in rows_now:
                         continue
-                    rows_now[symbol] = {
-                        "event_id": f"{kline.symbol}:{kline.interval}:{kline.open_time_ms}",
-                        "symbol": kline.symbol,
-                        "interval": kline.interval,
-                        "open_time_ms": kline.open_time_ms,
-                        "close_time_ms": kline.close_time_ms,
-                        "open": str(kline.open_price),
-                        "high": str(kline.high_price),
-                        "low": str(kline.low_price),
-                        "close": str(kline.close_price),
-                        "volume": str(kline.volume),
-                        "quote_volume": str(kline.quote_volume),
-                        "exchange_event_ms": kline.event_time_ms,
-                        "service_ingest_ms": kline.ingest_time_ms,
-                        "service_region": self._cfg.service_region,
-                        "source": "rest",
-                    }
+                    rows_now[symbol] = self._kline_row_dict(kline)
                     got_after_repair = len(rows_now)
                 repaired += 1
                 if got_after_repair >= publish_required:
@@ -786,11 +1157,56 @@ class App:
             expired = self._published_close_order.popleft()
             self._published_close_times.discard(expired)
 
+    def _mark_major_close_time_published_locked(self, topic: str, close_time_ms: int) -> None:
+        key = (topic, close_time_ms)
+        if key in self._major_published_close_times:
+            return
+        self._major_published_close_times.add(key)
+        self._major_published_close_order.append(key)
+        while len(self._major_published_close_order) > self._major_published_close_max:
+            expired = self._major_published_close_order.popleft()
+            self._major_published_close_times.discard(expired)
+
     async def _on_klines_client_connected(self, ws: WebSocketServerProtocol | WebSocket) -> None:
-        if self._klines_recent.maxlen == 0:
+        topics = await self._topics_for_client(ws)
+        await self._replay_klines_client(ws, topics)
+
+    async def _topics_for_client(self, ws: WebSocketServerProtocol | WebSocket) -> set[str]:
+        topics_for = getattr(self._klines_ws, "topics_for", None)
+        if callable(topics_for):
+            try:
+                topics = set(await topics_for(ws))
+            except Exception:
+                topics = set()
+        else:
+            topics = set()
+        if not topics:
+            topics.add(self._klines_all_topic)
+        return topics
+
+    async def _send_ws_text(self, ws: WebSocketServerProtocol | WebSocket, text: str) -> None:
+        send_text = getattr(ws, "send_text", None)
+        if callable(send_text):
+            await send_text(text)
+            return
+        await ws.send(text)
+
+    async def _replay_klines_client(self, ws: WebSocketServerProtocol | WebSocket, topics: set[str]) -> None:
+        if self._klines_recent_maxlen <= 0:
             return
         async with self._klines_recent_lock:
-            replay_payloads = list(self._klines_recent)
+            if "*" in topics:
+                replay_payloads = [
+                    payload
+                    for topic_payloads in self._klines_recent_by_topic.values()
+                    for payload in list(topic_payloads)
+                ]
+            else:
+                replay_payloads = [
+                    payload
+                    for topic in topics
+                    for payload in list(self._klines_recent_by_topic.get(topic, ()))
+                ]
         if not replay_payloads:
             return
         sent = 0
@@ -806,33 +1222,77 @@ class App:
                 for item in payload
             ]
             try:
-                await ws.send(orjson.dumps(replay_payload).decode("utf-8"))
+                await self._send_ws_text(ws, orjson.dumps(replay_payload).decode("utf-8"))
                 sent += 1
             except Exception:
                 break
-        logger.info("ws.client.replay name=klines replayed=%s", sent)
+        logger.info("ws.client.replay name=klines topics=%s replayed=%s", sorted(topics), sent)
 
     async def _enqueue_publish(self, close_time_ms: int, rows_by_symbol: dict[str, dict], first_ingest_ms: int | None) -> None:
+        await self._enqueue_topic_publish(
+            self._klines_all_topic,
+            close_time_ms,
+            rows_by_symbol,
+            first_ingest_ms,
+            notify_summary=True,
+            track_latency=True,
+        )
+
+    async def _enqueue_topic_publish(
+        self,
+        topic: str,
+        close_time_ms: int,
+        rows_by_symbol: dict[str, dict],
+        first_ingest_ms: int | None,
+        notify_summary: bool,
+        track_latency: bool,
+    ) -> None:
         if not rows_by_symbol:
             return
-        await self._publish_queue.put((close_time_ms, rows_by_symbol, first_ingest_ms))
+        await self._publish_queue.put(
+            (topic, close_time_ms, rows_by_symbol, first_ingest_ms, notify_summary, track_latency),
+        )
 
     async def _run_publish_worker(self, stop: asyncio.Event) -> None:
         while True:
             if stop.is_set() and self._publish_queue.empty():
                 break
             try:
-                close_time_ms, rows_by_symbol, first_ingest_ms = await asyncio.wait_for(self._publish_queue.get(), timeout=0.5)
+                topic, close_time_ms, rows_by_symbol, first_ingest_ms, notify_summary, track_latency = (
+                    await asyncio.wait_for(self._publish_queue.get(), timeout=0.5)
+                )
             except TimeoutError:
                 continue
             try:
-                await self._flush_close_time(close_time_ms, rows_by_symbol, first_ingest_ms)
+                await self._flush_close_time(
+                    topic,
+                    close_time_ms,
+                    rows_by_symbol,
+                    first_ingest_ms,
+                    notify_summary=notify_summary,
+                    track_latency=track_latency,
+                )
             except Exception:
-                logger.exception("klines.publish_worker.failed close_time_ms=%s", close_time_ms)
+                logger.exception("klines.publish_worker.failed topic=%s close_time_ms=%s", topic, close_time_ms)
             finally:
                 self._publish_queue.task_done()
 
-    async def _record_published_latency_state(self, payload: list[dict]) -> None:
+    async def _remember_recent_payload(self, topic: str, payload: list[dict]) -> None:
+        if self._klines_recent_maxlen <= 0 or not payload:
+            return
+        async with self._klines_recent_lock:
+            topic_recent = self._klines_recent_by_topic.get(topic)
+            if topic_recent is None:
+                topic_recent = deque(maxlen=self._klines_recent_maxlen)
+                self._klines_recent_by_topic[topic] = topic_recent
+            topic_recent.append(payload)
+
+    async def _record_published_latency_state(
+        self,
+        payload: list[dict],
+        topic: str,
+        send_ack_summary: bool,
+    ) -> None:
         if not payload:
             return
         cap = self._cfg.redis.pending_latency_max
@@ -860,22 +1320,30 @@ class App:
                 while len(self._pending_latency) >= cap:
                     drop = next(iter(self._pending_latency))
                     self._pending_latency.pop(drop, None)
-                self._pending_latency[event_id] = ev
+                event_key = (topic, event_id)
+                self._pending_latency[event_key] = ev
                 if close_time_ms > 0:
-                    self._event_close_time[event_id] = close_time_ms
+                    self._event_close_time[event_key] = (topic, close_time_ms)
         if payload:
             try:
                 close_time_ms = int(payload[0].get("close_time_ms") or 0)
             except (TypeError, ValueError):
                 close_time_ms = 0
             if close_time_ms > 0:
-                self._ack_expected_by_close[close_time_ms] = self._ack_expected_by_close.get(close_time_ms, 0) + len(payload)
-                self._ack_service_to_downstream_by_close.setdefault(close_time_ms, [])
-                if close_time_ms not in self._ack_notify_scheduled:
-                    self._ack_notify_scheduled.add(close_time_ms)
-                    asyncio.create_task(self._notify_ack_summary_later(close_time_ms, delay_seconds=20))
+                batch_key = (topic, close_time_ms)
+                self._ack_expected_by_close[batch_key] = self._ack_expected_by_close.get(batch_key, 0) + len(payload)
+                self._ack_service_to_downstream_by_close.setdefault(batch_key, [])
+                if batch_key not in self._ack_notify_scheduled:
+                    self._ack_notify_scheduled.add(batch_key)
+                    asyncio.create_task(
+                        self._notify_ack_summary_later(
+                            batch_key,
+                            delay_seconds=20,
+                            send_notification=send_ack_summary,
+                        ),
+                    )
 
-    def _build_published_latency_events(self, payload: list[dict]) -> list[dict[str, str]]:
+    def _build_published_latency_events(self, payload: list[dict], topic: str) -> list[dict[str, str]]:
         events: list[dict[str, str]] = []
         for row in payload:
             event_id = str(row.get("event_id") or "")
@@ -894,6 +1362,7 @@ class App:
                     "event_id": event_id,
                     "symbol": symbol,
                     "interval": interval,
+                    "topic": topic,
                     "exchange_to_service_ms": str(exchange_to_service_ms),
                     "service_region": self._cfg.service_region,
                     "phase": "published",
@@ -952,13 +1421,17 @@ class App:
         batch_compute_ack_item: dict | None = None
         batch_order_ack_item: dict | None = None
         if isinstance(payload, dict):
-            if payload.get("type") == "batch_ack":
+            msg_type = str(payload.get("type") or "")
+            if msg_type in ("subscribe", "set_topics", "unsubscribe"):
+                await self._apply_topic_subscription(_ws, payload, msg_type)
+                return
+            if msg_type == "batch_ack":
                 batch_ack_item = payload
-            elif payload.get("type") == "batch_integrated_ack":
+            elif msg_type == "batch_integrated_ack":
                 batch_integrated_ack_item = payload
-            elif payload.get("type") == "batch_compute_ack":
+            elif msg_type == "batch_compute_ack":
                 batch_compute_ack_item = payload
-            elif payload.get("type") == "batch_order_ack":
+            elif msg_type == "batch_order_ack":
                 batch_order_ack_item = payload
             elif "event_id" in payload:
                 ack_items = [payload]
@@ -981,6 +1454,40 @@ class App:
         for item in ack_items:
             await self._apply_downstream_ack(item, sender_client_id)
 
+    async def _apply_topic_subscription(self, ws: WebSocket, payload: dict, msg_type: str) -> None:
+        requested = payload.get("topics", payload.get("topic"))
+        if requested is None:
+            return
+        hub = self._klines_ws
+        if hub is None:
+            return
+        if msg_type == "set_topics":
+            set_topics = getattr(hub, "set_topics", None)
+            if callable(set_topics):
+                await set_topics(ws, requested)
+        elif msg_type == "unsubscribe":
+            remove_topics = getattr(hub, "remove_topics", None)
+            if callable(remove_topics):
+                await remove_topics(ws, requested)
+        else:
+            add_topics = getattr(hub, "add_topics", None)
+            if callable(add_topics):
+                await add_topics(ws, requested)
+        topics = await self._topics_for_client(ws)
+        await self._replay_klines_client(ws, topics)
+
+    def _ack_topic(self, item: dict) -> str:
+        return str(item.get("topic") or self._klines_all_topic)
+
+    def _batch_key_for_ack(self, item: dict, close_time_ms: int) -> tuple[str, int]:
+        batch_key = (self._ack_topic(item), close_time_ms)
+        if item.get("topic") or batch_key in self._batch_done_publish_ms_by_close:
+            return batch_key
+        matches = [key for key in self._batch_done_publish_ms_by_close.keys() if key[1] == close_time_ms]
+        if len(matches) == 1:
+            return matches[0]
+        return batch_key
+
     async def _apply_batch_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         try:
             close_time_ms = int(item.get("close_time_ms") or 0)
@@ -990,7 +1497,8 @@ class App:
             return
         if close_time_ms <= 0:
             return
-        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        batch_key = self._batch_key_for_ack(item, close_time_ms)
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(batch_key)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
         server_ingress_ms = int(time.time() * 1000)
@@ -1000,9 +1508,9 @@ class App:
             done_to_ack_ms = max(0, downstream_receive_ms - done_publish_ms)
         else:
             return
-        self._batch_done_to_ack_by_close.setdefault(close_time_ms, []).append(done_to_ack_ms)
+        self._batch_done_to_ack_by_close.setdefault(batch_key, []).append(done_to_ack_ms)
         if sender_client_id is not None:
-            self._batch_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+            self._batch_ack_clients_by_close.setdefault(batch_key, set()).add(sender_client_id)
 
     async def _apply_batch_integrated_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         try:
@@ -1013,7 +1521,8 @@ class App:
             return
         if close_time_ms <= 0:
             return
-        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        batch_key = self._batch_key_for_ack(item, close_time_ms)
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(batch_key)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
         server_ingress_ms = int(time.time() * 1000)
@@ -1023,9 +1532,9 @@ class App:
             done_to_integrated_ack_ms = max(0, integrated_ack_ms - done_publish_ms)
         else:
             return
-        self._batch_done_to_integrated_ack_by_close.setdefault(close_time_ms, []).append(done_to_integrated_ack_ms)
+        self._batch_done_to_integrated_ack_by_close.setdefault(batch_key, []).append(done_to_integrated_ack_ms)
         if sender_client_id is not None:
-            self._batch_integrated_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+            self._batch_integrated_ack_clients_by_close.setdefault(batch_key, set()).add(sender_client_id)
 
     async def _apply_batch_compute_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         try:
@@ -1036,7 +1545,8 @@ class App:
             return
         if close_time_ms <= 0:
             return
-        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        batch_key = self._batch_key_for_ack(item, close_time_ms)
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(batch_key)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
         server_ingress_ms = int(time.time() * 1000)
@@ -1046,9 +1556,9 @@ class App:
             done_to_compute_ack_ms = max(0, compute_ack_ms - done_publish_ms)
         else:
             return
-        self._batch_done_to_compute_ack_by_close.setdefault(close_time_ms, []).append(done_to_compute_ack_ms)
+        self._batch_done_to_compute_ack_by_close.setdefault(batch_key, []).append(done_to_compute_ack_ms)
         if sender_client_id is not None:
-            self._batch_compute_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+            self._batch_compute_ack_clients_by_close.setdefault(batch_key, set()).add(sender_client_id)
 
     async def _apply_batch_order_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         try:
@@ -1059,7 +1569,8 @@ class App:
             return
         if close_time_ms <= 0:
             return
-        done_publish_ms = self._batch_done_publish_ms_by_close.get(close_time_ms)
+        batch_key = (self._ack_topic(item), close_time_ms)
+        done_publish_ms = self._batch_done_publish_ms_by_close.get(batch_key)
         if done_publish_ms is None or done_publish_ms <= 0:
             return
         server_ingress_ms = int(time.time() * 1000)
@@ -1069,9 +1580,9 @@ class App:
             done_to_order_ack_ms = max(0, order_ack_ms - done_publish_ms)
         else:
             return
-        self._batch_done_to_order_ack_by_close.setdefault(close_time_ms, []).append(done_to_order_ack_ms)
+        self._batch_done_to_order_ack_by_close.setdefault(batch_key, []).append(done_to_order_ack_ms)
         if sender_client_id is not None:
-            self._batch_order_ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+            self._batch_order_ack_clients_by_close.setdefault(batch_key, set()).add(sender_client_id)
 
     async def _apply_downstream_ack(self, item: dict, sender_client_id: int | None = None) -> None:
         event_id = str(item.get("event_id") or "")
@@ -1082,12 +1593,21 @@ class App:
         except (TypeError, ValueError):
             return
         downstream_region = str(item.get("downstream_region") or "")
+        topic = self._ack_topic(item)
+        event_key = (topic, event_id)
 
         async with self._pending_latency_lock:
-            ev = self._pending_latency.pop(event_id, None)
-            close_time_ms = self._event_close_time.pop(event_id, None)
+            ev = self._pending_latency.pop(event_key, None)
+            batch_key = self._event_close_time.pop(event_key, None)
+            if ev is None and not item.get("topic"):
+                matches = [key for key in self._pending_latency.keys() if key[1] == event_id]
+                if len(matches) == 1:
+                    event_key = matches[0]
+                    topic = event_key[0]
+                    ev = self._pending_latency.pop(event_key, None)
+                    batch_key = self._event_close_time.pop(event_key, None)
         if ev is None:
-            logger.info("ack.unknown event_id=%s", event_id)
+            logger.info("ack.unknown topic=%s event_id=%s", topic, event_id)
             return
 
         server_ingress_ms = int(time.time() * 1000)
@@ -1108,18 +1628,19 @@ class App:
             ev.downstream_region,
             region_ok,
         )
-        if close_time_ms is not None:
-            self._ack_service_to_downstream_by_close.setdefault(close_time_ms, []).append(int(svc_to_downstream))
+        if batch_key is not None:
+            self._ack_service_to_downstream_by_close.setdefault(batch_key, []).append(int(svc_to_downstream))
             ingest_to_downstream = max(0, server_ingress_ms - ev.service_ingest_ms)
-            self._ack_ingest_to_downstream_by_close.setdefault(close_time_ms, []).append(int(ingest_to_downstream))
+            self._ack_ingest_to_downstream_by_close.setdefault(batch_key, []).append(int(ingest_to_downstream))
             if sender_client_id is not None:
-                self._ack_clients_by_close.setdefault(close_time_ms, set()).add(sender_client_id)
+                self._ack_clients_by_close.setdefault(batch_key, set()).add(sender_client_id)
         self._enqueue_latency_events(
             [
                 {
                     "event_id": ev.event_id,
                     "symbol": ev.symbol,
                     "interval": ev.interval,
+                    "topic": topic,
                     "e2e_ms": str(e2e),
                     "exchange_to_service_ms": str(ev.exchange_to_service_ms()),
                     "service_to_downstream_ms": str(svc_to_downstream),
@@ -1134,6 +1655,7 @@ class App:
     async def _notify_kline_batch(
         self,
         payload: list[dict],
+        topic: str,
         expected_symbols: int,
         missing_symbols: int,
         ws_count: int,
@@ -1165,8 +1687,9 @@ class App:
             close_time_key = 0
         if close_time_key <= 0:
             return
+        batch_key = (topic, close_time_key)
         metric_values = self._batch_metric_values_by_close.setdefault(
-            close_time_key,
+            batch_key,
             {
                 "batch_size": 0,
                 "expected_symbols": 0,
@@ -1190,6 +1713,7 @@ class App:
                 "shard_service_ingest_max_ms": {},
                 "shard_symbol_counts": {},
                 "delayed_tokens": [],
+                "major_symbol_latency": {},
             },
         )
         metric_values["batch_size"] = int(metric_values["batch_size"]) + len(payload)
@@ -1214,6 +1738,7 @@ class App:
         shard_ingest_min = metric_values["shard_service_ingest_min_ms"]
         shard_ingest_max = metric_values["shard_service_ingest_max_ms"]
         shard_symbol_counts = metric_values["shard_symbol_counts"]
+        major_symbol_latency = metric_values["major_symbol_latency"]
         if isinstance(cast_b2s, list):
             cast_b2s.extend(b2s_values)
         if isinstance(cast_s2p, list):
@@ -1258,6 +1783,17 @@ class App:
                     continue
                 if not symbol or row_service_ingest_ms <= 0 or row_service_publish_ms <= 0:
                     continue
+                if isinstance(major_symbol_latency, dict) and symbol in self._major_symbol_set:
+                    major_symbol_latency[symbol] = {
+                        "interval": str(row.get("interval") or ""),
+                        "exchange_to_service_ms": (
+                            max(0, row_service_ingest_ms - row_exchange_event_ms)
+                            if row_exchange_event_ms > 0
+                            else 0
+                        ),
+                        "local_wait_ms": max(0, row_service_publish_ms - row_service_ingest_ms),
+                        "close_to_push_done_ms": max(0, push_done_ms - row_close_time_ms),
+                    }
                 wait_ms = max(0, row_service_publish_ms - row_service_ingest_ms)
                 cast_delayed_tokens.append(
                     {
@@ -1315,10 +1851,12 @@ class App:
 
         final_push_done_ms = int(metric_values["last_push_done_ms"])
         close_to_push_done_ms = final_push_done_ms - close_time_key
+        first_publish_final_ms = int(metric_values["first_publish_ms"])
+        close_to_publish_ms = first_publish_final_ms - close_time_key if first_publish_final_ms > 0 else 0
 
         shard_push_done_ms = max(
             0,
-            int(metric_values["last_push_done_ms"]) - int(metric_values["first_publish_ms"]),
+            int(metric_values["last_push_done_ms"]) - first_publish_final_ms,
         )
         full_arrival_ms = (
             max(0, service_ingest_max_ms - exchange_event_min_ms)
@@ -1379,8 +1917,14 @@ class App:
                 delayed_parts.append(f"{symbol}:等待{wait_ms}ms(close={readable_close})")
             if delayed_parts:
                 delayed_top_text = "；".join(delayed_parts)
+        major_latency_text = (
+            self._format_major_symbol_latency(major_symbol_latency)
+            if isinstance(major_symbol_latency, dict)
+            else ""
+        )
 
-        self._batch_summary_by_close[close_time_key] = {
+        self._batch_summary_by_close[batch_key] = {
+            "topic": topic,
             "close_time_ms": close_time_key,
             "batch_size": int(metric_values["batch_size"]),
             "expected_symbols": int(metric_values["expected_symbols"]),
@@ -1397,42 +1941,35 @@ class App:
             "binance_to_service_shard_arrival_ms": shard_arrival_text,
             "binance_to_service_round_arrival_ms": round_b2s_text,
             "delayed_tokens_top10": delayed_top_text,
+            "major_symbol_latency": major_latency_text,
+            "close_time_to_publish_ms": close_to_publish_ms,
             "last_batch_push_done_ms": final_push_done_ms,
             "close_time_to_push_done_ms": close_to_push_done_ms,
         }
 
-    async def _notify_ack_summary_later(self, close_time_ms: int, delay_seconds: int) -> None:
+    async def _notify_ack_summary_later(
+        self,
+        batch_key: tuple[str, int],
+        delay_seconds: int,
+        send_notification: bool = True,
+    ) -> None:
         await asyncio.sleep(max(1, delay_seconds))
-        expected = self._ack_expected_by_close.get(close_time_ms, 0)
-        values = self._ack_service_to_downstream_by_close.get(close_time_ms, [])
-        ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(close_time_ms, [])
-        batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(close_time_ms, [])
-        batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(close_time_ms, [])
-        batch_done_to_compute_ack_values = self._batch_done_to_compute_ack_by_close.get(close_time_ms, [])
-        batch_done_to_order_ack_values = self._batch_done_to_order_ack_by_close.get(close_time_ms, [])
-        ack_clients = len(self._ack_clients_by_close.get(close_time_ms, set()))
-        batch_ack_clients = len(self._batch_ack_clients_by_close.get(close_time_ms, set()))
-        batch_integrated_ack_clients = len(self._batch_integrated_ack_clients_by_close.get(close_time_ms, set()))
-        batch_compute_ack_clients = len(self._batch_compute_ack_clients_by_close.get(close_time_ms, set()))
-        batch_order_ack_clients = len(self._batch_order_ack_clients_by_close.get(close_time_ms, set()))
-        batch = self._batch_summary_by_close.get(close_time_ms, {})
-        raw_metrics = self._batch_metric_values_by_close.get(close_time_ms, {})
-        round_sizes = raw_metrics.get("push_round_sizes", [])
-        round_no_ack = raw_metrics.get("push_round_no_ack_ms", [])
-        push_stage_header = "服务端一次性推送耗时（按推送轮次）"
-        round_ms_label = "单次推送耗时"
-        post_push_ack_label = "一次性推送全部完成后"
-        round_lines: list[str] = []
-        if isinstance(round_sizes, list) and isinstance(round_no_ack, list):
-            total_rounds = min(len(round_sizes), len(round_no_ack))
-            for idx in range(total_rounds):
-                try:
-                    round_sz = int(round_sizes[idx])
-                    round_ms = int(round_no_ack[idx])
-                except (TypeError, ValueError):
-                    continue
-                round_lines.append(f"第{idx + 1}次：symbols={round_sz} {round_ms_label}={round_ms}ms")
-        direct_push_stage_text = self._format_round_lines(round_lines)
+        topic, close_time_ms = batch_key
+        expected = self._ack_expected_by_close.get(batch_key, 0)
+        values = self._ack_service_to_downstream_by_close.get(batch_key, [])
+        ingest_to_downstream_values = self._ack_ingest_to_downstream_by_close.get(batch_key, [])
+        batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(batch_key, [])
+        batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(batch_key, [])
+        batch_done_to_compute_ack_values = self._batch_done_to_compute_ack_by_close.get(batch_key, [])
+        batch_done_to_order_ack_values = self._batch_done_to_order_ack_by_close.get(batch_key, [])
+        ack_clients = len(self._ack_clients_by_close.get(batch_key, set()))
+        batch_ack_clients = len(self._batch_ack_clients_by_close.get(batch_key, set()))
+        batch_integrated_ack_clients = len(self._batch_integrated_ack_clients_by_close.get(batch_key, set()))
+        batch_compute_ack_clients = len(self._batch_compute_ack_clients_by_close.get(batch_key, set()))
+        batch_order_ack_clients = len(self._batch_order_ack_clients_by_close.get(batch_key, set()))
+        batch = self._batch_summary_by_close.get(batch_key, {})
+        raw_metrics = self._batch_metric_values_by_close.get(batch_key, {})
+        s2c_no_ack_values = raw_metrics.get("s2c_no_ack_values", [])
         ctp = batch.get("close_time_to_push_done_ms")
         if isinstance(ctp, int):
             ctp_line = f"{ctp:+d}ms"
@@ -1440,66 +1977,64 @@ class App:
             ctp_line = "n/a"
         else:
             ctp_line = str(ctp)
-        lpd = batch.get("last_batch_push_done_ms")
-        if isinstance(lpd, int):
-            lpd_line = str(lpd)
-        elif lpd is None:
-            lpd_line = "n/a"
-        else:
-            lpd_line = str(lpd)
-        body = (
-            "【K线批次与ACK汇总】\n"
-            f"推送模式：{'随到齐即一次性推送（多轮统计）' if self._klines_passthrough_mode else '服务端聚合后整批一次性下发'}\n"
-            f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
-            f"收盘至推送完成（K线 close_time_ms → 本批最后一次 WebSocket 写出）：{ctp_line}\n"
-            f"（末次 push_done_ms={lpd_line}；close_time_ms 为 Binance 返回的当根 K 线最后一毫秒）\n"
-            f"推送数量：{batch.get('batch_size', expected)}\n"
-            f"期望总数：{batch.get('expected_symbols', expected)}\n"
-            f"缺失数量：{batch.get('missing_symbols', max(0, expected - len(values)))}\n"
-            f"WS条数：{batch.get('ws_count', 0)}\n"
-            f"REST条数：{batch.get('rest_count', 0)}\n"
-            f"{push_stage_header}：{direct_push_stage_text}\n"
-            f"Binance到服务端：{batch.get('binance_to_service', 'n=0')}\n"
-            f"批次首事件到末入站耗时：{batch.get('binance_to_service_full_arrival_ms', 0)}ms\n"
-            f"Binance到服务端（全市场一次性推送到齐）：{batch.get('binance_to_service_shard_arrival_ms', 'n=0')}\n"
-            f"Binance到服务端（一次性推送接收轮次）：{batch.get('binance_to_service_round_arrival_ms', 'n=0')}\n"
-            f"服务端接收分布跨度（ingest spread）：{batch.get('service_ingest_spread_ms', 0)}ms\n"
-            f"服务端推送完成跨度（首轮 publish 至末轮 push_done）：{batch.get('service_ws_shards_push_done_ms', 0)}ms\n"
-            f"服务端到客户端(不含ACK)：{batch.get('service_to_client_no_ack', 'n=0')}\n"
-            f"延迟代币Top10：{batch.get('delayed_tokens_top10', 'n=0')}\n"
-            f"K线客户端连接数：{batch.get('connected_clients', 0)}\n"
-            f"批次ACK上报客户端数：{batch_ack_clients}\n"
-            f"批次整合ACK上报客户端数：{batch_integrated_ack_clients}\n"
-            f"批次计算ACK上报客户端数：{batch_compute_ack_clients}\n"
-            f"批次下单ACK上报客户端数：{batch_order_ack_clients}\n"
-            f"{post_push_ack_label}批次ACK耗时：{self._format_stats(batch_done_to_ack_values)}\n"
-            f"{post_push_ack_label}整合ACK耗时：{self._format_stats(batch_done_to_integrated_ack_values)}\n"
-            f"{post_push_ack_label}计算ACK耗时：{self._format_stats(batch_done_to_compute_ack_values)}\n"
-            f"{post_push_ack_label}下单ACK耗时：{self._format_stats(batch_done_to_order_ack_values)}\n"
-        )
         try:
-            await self._notifier.send("K线批次与ACK汇总", body)
+            if send_notification:
+                try:
+                    batch_size = int(batch.get("batch_size") or 0)
+                    expected_total = int(batch.get("expected_symbols") or expected or 0)
+                    missing_total = int(batch.get("missing_symbols") or max(0, expected - len(values)))
+                    close_to_publish_ms = int(batch.get("close_time_to_publish_ms") or 0)
+                    publish_to_push_done_ms = int(batch.get("service_ws_shards_push_done_ms") or 0)
+                    ingest_spread_ms = int(batch.get("service_ingest_spread_ms") or 0)
+                    connected_clients = int(batch.get("connected_clients") or 0)
+                except (TypeError, ValueError):
+                    batch_size = int(expected or 0)
+                    expected_total = int(expected or 0)
+                    missing_total = 0
+                    close_to_publish_ms = 0
+                    publish_to_push_done_ms = 0
+                    ingest_spread_ms = 0
+                    connected_clients = 0
+                major_latency = str(batch.get("major_symbol_latency") or "")
+                show_major_latency = topic in (self._major_1h_topic, self._major_1m_topic)
+                s2c_values = s2c_no_ack_values if isinstance(s2c_no_ack_values, list) else []
+                body = (
+                    "【K线批次与ACK汇总】\n"
+                    f"Topic：{topic}\n"
+                    f"收盘时间：{self._format_close_time(batch.get('close_time_ms', close_time_ms))}\n"
+                    f"数据源/模式：{self._topic_data_source_label(batch)} / {self._push_mode_label(topic)}\n"
+                    f"推送：{batch_size}/{expected_total} 缺失={missing_total} 客户端={connected_clients}\n"
+                    f"服务端链路：收盘边界→本地聚合完成={close_to_publish_ms}ms；本地聚合完成→WS写出完成={publish_to_push_done_ms}ms；收盘→WS写出完成={ctp_line}\n"
+                    f"接收跨度：{ingest_spread_ms}ms；服务端→客户端(不含ACK)：{self._format_stats_short(s2c_values)}\n"
+                    f"ACK客户端：接收={batch_ack_clients} 整合={batch_integrated_ack_clients} 计算={batch_compute_ack_clients} 下单={batch_order_ack_clients}\n"
+                    f"客户端接收ACK耗时：{self._format_stats_short(batch_done_to_ack_values)}\n"
+                    f"计算ACK耗时：{self._format_stats_short(batch_done_to_compute_ack_values)}\n"
+                    f"下单ACK耗时：{self._format_stats_short(batch_done_to_order_ack_values)}\n"
+                )
+                if show_major_latency and major_latency:
+                    body += major_latency + "\n"
+                await self._notifier.send("K线批次与ACK汇总", body)
         except Exception:
-            logger.exception("notify.ack_summary_failed close_time_ms=%s", close_time_ms)
+            logger.exception("notify.ack_summary_failed topic=%s close_time_ms=%s", topic, close_time_ms)
         finally:
-            self._ack_service_to_downstream_by_close.pop(close_time_ms, None)
-            self._ack_ingest_to_downstream_by_close.pop(close_time_ms, None)
-            self._batch_done_to_ack_by_close.pop(close_time_ms, None)
-            self._batch_done_to_integrated_ack_by_close.pop(close_time_ms, None)
-            self._batch_done_to_compute_ack_by_close.pop(close_time_ms, None)
-            self._batch_done_to_order_ack_by_close.pop(close_time_ms, None)
-            self._ack_expected_by_close.pop(close_time_ms, None)
-            self._ack_clients_by_close.pop(close_time_ms, None)
-            self._batch_ack_clients_by_close.pop(close_time_ms, None)
-            self._batch_integrated_ack_clients_by_close.pop(close_time_ms, None)
-            self._batch_compute_ack_clients_by_close.pop(close_time_ms, None)
-            self._batch_order_ack_clients_by_close.pop(close_time_ms, None)
-            self._batch_summary_by_close.pop(close_time_ms, None)
-            self._batch_metric_values_by_close.pop(close_time_ms, None)
+            self._ack_service_to_downstream_by_close.pop(batch_key, None)
+            self._ack_ingest_to_downstream_by_close.pop(batch_key, None)
+            self._batch_done_to_ack_by_close.pop(batch_key, None)
+            self._batch_done_to_integrated_ack_by_close.pop(batch_key, None)
+            self._batch_done_to_compute_ack_by_close.pop(batch_key, None)
+            self._batch_done_to_order_ack_by_close.pop(batch_key, None)
+            self._ack_expected_by_close.pop(batch_key, None)
+            self._ack_clients_by_close.pop(batch_key, None)
+            self._batch_ack_clients_by_close.pop(batch_key, None)
+            self._batch_integrated_ack_clients_by_close.pop(batch_key, None)
+            self._batch_compute_ack_clients_by_close.pop(batch_key, None)
+            self._batch_order_ack_clients_by_close.pop(batch_key, None)
+            self._batch_summary_by_close.pop(batch_key, None)
+            self._batch_metric_values_by_close.pop(batch_key, None)
             self._passthrough_shards_sent_by_close.pop(close_time_ms, None)
             self._passthrough_total_shards_by_close.pop(close_time_ms, None)
-            self._batch_done_publish_ms_by_close.pop(close_time_ms, None)
-            self._ack_notify_scheduled.discard(close_time_ms)
+            self._batch_done_publish_ms_by_close.pop(batch_key, None)
+            self._ack_notify_scheduled.discard(batch_key)
 
     def _format_stats(self, values: list[int]) -> str:
         if not values:
@@ -1512,6 +2047,59 @@ class App:
             f"n={len(values_sorted)} 本次={current}ms "
             f"avg={avg:.2f}ms p95={p95:.2f}ms min={values_sorted[0]}ms max={values_sorted[-1]}ms"
         )
+
+    def _format_stats_short(self, values: list[int]) -> str:
+        if not values:
+            return "n=0"
+        current = values[-1]
+        values_sorted = sorted(values)
+        p95 = self._percentile(values_sorted, 95.0)
+        return f"n={len(values_sorted)} 本次={current}ms p95={p95:.0f}ms max={values_sorted[-1]}ms"
+
+    def _format_major_symbol_latency(self, values_by_symbol: dict) -> str:
+        if not values_by_symbol:
+            return ""
+        lines: list[str] = []
+        interval = ""
+        for symbol in self._major_symbols:
+            item = values_by_symbol.get(symbol)
+            if not isinstance(item, dict):
+                continue
+            interval = interval or str(item.get("interval") or "")
+            label = symbol.removesuffix("USDT")
+            try:
+                exchange_to_service_ms = int(item.get("exchange_to_service_ms") or 0)
+                local_wait_ms = int(item.get("local_wait_ms") or 0)
+                close_to_push_done_ms = int(item.get("close_to_push_done_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            lines.append(
+                f"{label}: 交易所→服务={exchange_to_service_ms}ms 本地等待={local_wait_ms}ms 收盘→推送=+{close_to_push_done_ms}ms",
+            )
+        if not lines:
+            return ""
+        suffix = f"({interval})" if interval else ""
+        return "重点币耗时" + suffix + "：\n" + "\n".join(lines)
+
+    def _topic_data_source_label(self, batch: dict) -> str:
+        try:
+            rest_count = int(batch.get("rest_count") or 0)
+        except (TypeError, ValueError):
+            rest_count = 0
+        return "kline(ws+rest)" if rest_count > 0 else "kline(ws)"
+
+    def _push_mode_label(self, topic: str) -> str:
+        if topic == self._klines_all_topic:
+            if self._klines_passthrough_mode:
+                return f"全量{self._klines_interval}分片多轮"
+            return f"全量{self._klines_interval}聚合整批"
+        if topic == self._major_1h_topic:
+            return f"重点币{self._major_1h_interval}独立WSS直推"
+        if topic == self._major_1m_topic:
+            if self._should_publish_alert_major_1m_klines() and not self._major_1m_enabled:
+                return f"重点币{self._major_1m_interval}复用告警WSS直推"
+            return f"重点币{self._major_1m_interval}独立WSS直推"
+        return "服务端整批"
 
     def _format_round_lines(self, lines: list[str], head: int = 12, tail: int = 5) -> str:
         if not lines:
@@ -1543,30 +2131,72 @@ class App:
         frac = rank - lo
         return values_sorted[lo] + (values_sorted[hi] - values_sorted[lo]) * frac
 
-    async def _run_1m_alerts(self, symbols: list[str]) -> None:
+    async def _run_1m_alerts(
+        self,
+        symbols: list[str],
+        batch_size: int = 200,
+        stream_key: str | None = None,
+        publish_kline_topic: str | None = None,
+        publish_kline_symbols: set[str] | None = None,
+    ) -> None:
         if self._alerts is None:
             return
-        async for kline in self._binance.iter_closed_klines(symbols, interval="1m"):
+        latest_close_by_symbol: dict[str, int] = {}
+        publish_symbols = publish_kline_symbols or set()
+        async for kline in self._binance.iter_closed_klines(
+            symbols,
+            interval="1m",
+            batch_size=batch_size,
+            stream_key=stream_key,
+        ):
             self._ingest_1m += 1
+            prev_close = latest_close_by_symbol.get(kline.symbol)
+            is_new_closed_kline = prev_close is None or kline.close_time_ms > prev_close
+            if is_new_closed_kline:
+                latest_close_by_symbol[kline.symbol] = kline.close_time_ms
             signals = await self._alerts.on_closed_1m(kline)
-            if not signals or self._alerts_ws is None:
-                continue
-            for sig in signals:
-                pushed = await self._alerts_ws.broadcast_json(self._alert_payload(sig))
-                if pushed > 0:
-                    self._push_alerts += pushed
+            if (
+                publish_kline_topic
+                and is_new_closed_kline
+                and kline.symbol in publish_symbols
+            ):
+                await self._add_major_topic_kline(kline, publish_kline_topic, publish_symbols)
+            if signals and self._alerts_ws is not None:
+                for sig in signals:
+                    pushed = await self._alerts_ws.broadcast_json(self._alert_payload(sig))
+                    if pushed > 0:
+                        self._push_alerts += pushed
 
     async def _run_heartbeat(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await asyncio.sleep(15)
             alerts_clients = await self._alerts_ws.client_count() if self._alerts_ws is not None else 0
             klines_clients = await self._klines_ws.client_count() if self._klines_ws is not None else 0
+            all_topic_clients = (
+                await self._klines_ws.client_count(self._klines_all_topic) if self._klines_ws is not None else 0
+            )
+            major_1h_clients = (
+                await self._klines_ws.client_count(self._major_1h_topic) if self._klines_ws is not None else 0
+            )
+            major_1m_clients = (
+                await self._klines_ws.client_count(self._major_1m_topic) if self._klines_ws is not None else 0
+            )
             ws_activity = self._binance.get_ws_activity_snapshot()
             ws_shard_health = self._binance.get_ws_shard_health_snapshot()
-            ws_ago_ms = ws_activity.get(self._klines_interval)
-            interval_shards = ws_shard_health.get(self._klines_interval, {})
+            ws_ago_ms = ws_activity.get(self._klines_stream_key)
+            major_1h_ago_ms = ws_activity.get(self._major_1h_stream_key)
+            alert_1m_ago_ms = ws_activity.get(self._alert_1m_stream_key)
+            alert_major_1m_ago_ms = ws_activity.get(self._alert_major_1m_stream_key)
+            major_1m_ago_ms = ws_activity.get(self._major_1m_interval)
+            if major_1m_ago_ms is None:
+                major_1m_ago_ms = ws_activity.get(self._major_1m_stream_key)
+            interval_shards = ws_shard_health.get(self._klines_stream_key, {})
+            major_1h_shards = ws_shard_health.get(self._major_1h_stream_key, {})
+            alert_1m_shards = ws_shard_health.get(self._alert_1m_stream_key, {})
+            alert_major_1m_shards = ws_shard_health.get(self._alert_major_1m_stream_key, {})
+            major_1m_shards = ws_shard_health.get(self._major_1m_stream_key, {})
             logger.info(
-                "service.heartbeat mode=%s ingest_1m=%s ingest_1h=%s pushed_alerts=%s pushed_1h=%s clients_alerts=%s clients_klines=%s klines_interval=%s ws_last_event_ago_ms=%s ws_stale_shards=%s ws_total_shards=%s ws_worst_shard_ago_ms=%s",
+                "service.heartbeat mode=%s ingest_1m=%s ingest_1h=%s pushed_alerts=%s pushed_1h=%s clients_alerts=%s clients_klines=%s clients_klines_all_topic=%s clients_majors_1h=%s clients_majors_1m=%s alert_1m_last_event_ago_ms=%s alert_1m_total_shards=%s alert_major_1m_last_event_ago_ms=%s alert_major_1m_total_shards=%s klines_interval=%s ws_last_event_ago_ms=%s ws_stale_shards=%s ws_total_shards=%s ws_worst_shard_ago_ms=%s major_1h_interval=%s major_1h_last_event_ago_ms=%s major_1h_total_shards=%s major_1m_interval=%s major_1m_last_event_ago_ms=%s major_1m_total_shards=%s",
                 self._cfg.service_mode,
                 self._ingest_1m,
                 self._ingest_1h,
@@ -1574,11 +2204,24 @@ class App:
                 self._push_1h,
                 alerts_clients,
                 klines_clients,
+                all_topic_clients,
+                major_1h_clients,
+                major_1m_clients,
+                alert_1m_ago_ms,
+                alert_1m_shards.get("total_shards"),
+                alert_major_1m_ago_ms,
+                alert_major_1m_shards.get("total_shards"),
                 self._klines_interval,
                 ws_ago_ms,
                 interval_shards.get("stale_shards"),
                 interval_shards.get("total_shards"),
                 interval_shards.get("worst_shard_ago_ms"),
+                self._major_1h_interval,
+                major_1h_ago_ms,
+                major_1h_shards.get("total_shards"),
+                self._major_1m_interval,
+                major_1m_ago_ms,
+                major_1m_shards.get("total_shards"),
             )
 
     def _alert_payload(self, signal: AlertSignal) -> dict:

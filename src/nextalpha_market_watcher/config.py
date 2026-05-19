@@ -51,6 +51,10 @@ class AlertsConfig(BaseModel):
     threshold_1h_pct: float = 25.0
     threshold_4h_pct: float = 40.0
     cooldown_seconds: int = 900
+    major_1m_enabled: bool = True
+    publish_major_1m_klines: bool = True
+    # Empty means reuse websocket.klines_major_symbols.
+    major_symbols: list[str] = Field(default_factory=list)
 
 
 class WebhookConfig(BaseModel):
@@ -75,8 +79,20 @@ class WebSocketPushConfig(BaseModel):
     host: str = "0.0.0.0"
     alerts_port: int = 8765
     klines_port: int = 8766
-    klines_interval: str = "5m"
+    klines_interval: str = "1h"
+    klines_all_topic: str = ""
     klines_ws_batch_size: int = 200
+    klines_major_symbols: list[str] = Field(
+        default_factory=lambda: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+    )
+    klines_exclude_major_symbols: bool = True
+    klines_major_1h_enabled: bool = True
+    klines_major_1h_interval: str = "1h"
+    klines_major_1h_topic: str = "klines.majors.1h"
+    klines_major_1m_enabled: bool = False
+    klines_major_1m_interval: str = "1m"
+    klines_major_1m_topic: str = "klines.majors.1m"
+    klines_major_batch_max_wait_ms: int = 3_000
     # If True, publish each closed kline row immediately to downstream clients
     # without server-side close_time batch aggregation.
     klines_passthrough_mode: bool = False
