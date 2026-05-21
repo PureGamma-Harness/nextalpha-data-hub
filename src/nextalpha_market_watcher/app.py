@@ -81,13 +81,7 @@ class App:
         self._max_missing_symbols = max(0, self._cfg.websocket.klines_max_missing_symbols)
         self._pending_lock = asyncio.Lock()
         self._klines_interval = self._cfg.websocket.klines_interval.strip() or "1h"
-        configured_klines_source = self._cfg.websocket.klines_source
-        if cfg.service_mode in ("klines", "all") and configured_klines_source != "aggtrade":
-            logger.warning(
-                "klines.kline_ws.disabled configured_source=%s effective_source=aggtrade",
-                configured_klines_source,
-            )
-        self._klines_source = "aggtrade"
+        self._klines_source = self._cfg.websocket.klines_source
         self._klines_ws_batch_size = max(1, self._cfg.websocket.klines_ws_batch_size)
         self._klines_passthrough_mode = bool(self._cfg.websocket.klines_passthrough_mode)
         self._rest_repair_delay_ms = self._resolve_rest_repair_delay_ms(self._klines_interval)
@@ -414,6 +408,12 @@ class App:
                 await self._enqueue_publish(close_ms, rows, first_ingest)
 
     def _publish_kline_iter(self, symbols: list[str]):
+        if self._klines_source == "kline":
+            return self._binance.iter_closed_klines(
+                symbols,
+                interval=self._klines_interval,
+                batch_size=self._klines_ws_batch_size,
+            )
         return self._binance.iter_aggtrade_klines(
             symbols,
             interval=self._klines_interval,

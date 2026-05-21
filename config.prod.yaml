@@ -61,8 +61,8 @@ websocket:
   alerts_port: 8765
   klines_port: 8766
   klines_interval: 1h
-  # K线批次固定使用 @aggTrade 本地聚合；不再开启 @kline_<interval> 的 x.k=true 长连接
-  klines_source: aggtrade
+  # K线批次使用 Binance 原生 @kline_<interval> 闭合帧；成交额直接取 k.q，与 REST row[7] 同口径。
+  klines_source: kline
   aggtrade_emit_grace_ms: 800
   # 单个 symbol 的事件延迟不再触发 hold/reconnect；整条分片静默由 watchdog 处理
   aggtrade_ws_max_event_lag_seconds: 0.0

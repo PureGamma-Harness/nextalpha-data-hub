@@ -81,10 +81,9 @@ class WebSocketPushConfig(BaseModel):
     alerts_port: int = 8765
     klines_port: int = 8766
     klines_interval: str = "5m"
-    # Kline batch publishing uses local @aggTrade aggregation.
-    # The legacy "kline" value is accepted for old configs, but App forces it off
-    # so the Kline service does not open a second @kline_<interval> WebSocket.
-    klines_source: KlinesSource = "aggtrade"
+    # kline = Binance native @kline_<interval> closed frames (authoritative OHLCV/Q).
+    # aggtrade = local @aggTrade aggregation, kept only for diagnostics/experiments.
+    klines_source: KlinesSource = "kline"
     klines_ws_batch_size: int = 80
     # Only used when klines_source=aggtrade.
     aggtrade_emit_grace_ms: int = 800
