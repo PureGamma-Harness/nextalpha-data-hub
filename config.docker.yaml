@@ -51,9 +51,11 @@ alerts:
 
 webhook:
   enabled: true
-  url: "https://open.larksuite.com/open-apis/bot/v2/hook/7187f951-2496-4c16-a026-4cb67bf9ef77"
+  # Secrets: leave empty here and supply via env vars WEBHOOK__URL /
+  # WEBHOOK__ALERTS_URL (empty YAML values do not override env).
+  url: ""
   proxy_url: socks5://host.docker.internal:10808
-  alerts_url: "https://open.larksuite.com/open-apis/bot/v2/hook/ade1cabd-dcd8-49c0-a98e-cbcc5a1e11b0"
+  alerts_url: ""
 
 latency:
   e2e_warn_ms: 1500

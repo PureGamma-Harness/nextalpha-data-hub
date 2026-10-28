@@ -3,23 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
-from pathlib import Path
 
 import uvicorn
-import yaml
 
 from .app import App
-from .config import AppConfig
+from .config import AppConfig, load_config
 from .fastapi_server import create_app
 from .logging_utils import setup_logging
-
-
-def _load_config(path: str, service_mode: str | None = None) -> AppConfig:
-    config_path = Path(path)
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    if service_mode is not None:
-        data["service_mode"] = service_mode
-    return AppConfig(**data)
 
 
 async def _run_with_signals(cfg: AppConfig) -> None:
@@ -64,7 +54,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.cmd == "run":
-        cfg = _load_config(args.config, service_mode=args.mode)
+        cfg = load_config(args.config, service_mode=args.mode)
         setup_logging(cfg.log_level)
         try:
             asyncio.run(_run_with_signals(cfg))

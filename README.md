@@ -40,6 +40,26 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build \
   market-watcher-alerts market-watcher-klines
 ```
 
+### Webhook 密钥（环境变量）
+
+Lark webhook URL 属于密钥，**不要写入 YAML 提交到仓库**。YAML 中保持 `url: ""` / `alerts_url: ""`，通过环境变量注入
+（嵌套字段用 `__` 分隔，YAML 中为空或 null 的值不会覆盖环境变量；YAML 中非空值优先于环境变量）：
+
+| 环境变量 | 对应配置 | 说明 |
+|----------|----------|------|
+| `WEBHOOK__URL` | `webhook.url` | 默认 Lark 机器人 webhook（K线批次/诊断通知） |
+| `WEBHOOK__ALERTS_URL` | `webhook.alerts_url` | 告警专用 webhook；为空时复用 `WEBHOOK__URL` |
+| `WEBHOOK__PROXY_URL` | `webhook.proxy_url` | 可选，webhook 请求代理 |
+
+Docker Compose 会从仓库根目录的 `.env`（已在 `.gitignore` 中）读取上述变量：
+
+```bash
+cat > .env <<'ENV'
+WEBHOOK__URL=https://open.larksuite.com/open-apis/bot/v2/hook/<token>
+WEBHOOK__ALERTS_URL=https://open.larksuite.com/open-apis/bot/v2/hook/<token>
+ENV
+```
+
 改配置：编辑 `config.docker.yaml` 后 `docker compose restart market-watcher-alerts market-watcher-klines`。  
 本地试跑少量交易对：将其中 `binance.use_test_symbols` 设为 `true` 并填写 `test_symbols`。
 

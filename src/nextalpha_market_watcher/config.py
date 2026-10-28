@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
+import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -130,7 +132,11 @@ class WebSocketPushConfig(BaseModel):
 
 
 class AppConfig(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore")
+    # Nested fields can be supplied via env vars using "__" as the delimiter,
+    # e.g. WEBHOOK__URL, WEBHOOK__ALERTS_URL, WEBHOOK__PROXY_URL.
+    # Note: values passed as init kwargs (i.e. from YAML) take precedence over
+    # env vars; use load_config() so empty secret fields in YAML defer to env.
+    model_config = SettingsConfigDict(extra="ignore", env_nested_delimiter="__")
 
     app_name: str = "nextalpha-market-watcher"
     service_region: str = "unknown"
@@ -144,3 +150,39 @@ class AppConfig(BaseSettings):
     latency: LatencyConfig = LatencyConfig()
     metrics: MetricsConfig = MetricsConfig()
     websocket: WebSocketPushConfig = WebSocketPushConfig()
+
+
+# Webhook fields that are secrets (or deployment-specific) and should be
+# provided via environment variables. An empty/null value in YAML must not
+# shadow the corresponding env var.
+_ENV_OVERRIDABLE_WEBHOOK_FIELDS = ("url", "alerts_url", "proxy_url")
+
+
+def _drop_empty_webhook_fields(data: dict[str, Any]) -> dict[str, Any]:
+    webhook = data.get("webhook")
+    if not isinstance(webhook, dict):
+        return data
+    cleaned = dict(webhook)
+    for key in _ENV_OVERRIDABLE_WEBHOOK_FIELDS:
+        value = cleaned.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            cleaned.pop(key, None)
+    out = dict(data)
+    out["webhook"] = cleaned
+    return out
+
+
+def load_config(path: str | Path, service_mode: str | None = None) -> AppConfig:
+    """Load AppConfig from a YAML file, letting env vars fill empty secrets.
+
+    Precedence per field: non-empty YAML value > env var > model default.
+    For webhook.url / webhook.alerts_url / webhook.proxy_url an empty or null
+    YAML value is treated as unset so WEBHOOK__URL etc. can supply it.
+    """
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"config file {path} must contain a YAML mapping")
+    data = _drop_empty_webhook_fields(data)
+    if service_mode is not None:
+        data["service_mode"] = service_mode
+    return AppConfig(**data)

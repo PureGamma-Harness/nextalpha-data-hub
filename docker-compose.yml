@@ -8,6 +8,10 @@ services:
       dockerfile: Dockerfile
     container_name: nextalpha-market-watcher-alerts
     restart: unless-stopped
+    environment:
+      # Lark webhook secrets; set them in a local .env file (git-ignored) or the shell.
+      WEBHOOK__URL: ${WEBHOOK__URL:-}
+      WEBHOOK__ALERTS_URL: ${WEBHOOK__ALERTS_URL:-}
     command:
       - nextalpha-watcher
       - serve
@@ -34,6 +38,10 @@ services:
       dockerfile: Dockerfile
     container_name: nextalpha-market-watcher-klines
     restart: unless-stopped
+    environment:
+      # Lark webhook secrets; set them in a local .env file (git-ignored) or the shell.
+      WEBHOOK__URL: ${WEBHOOK__URL:-}
+      WEBHOOK__ALERTS_URL: ${WEBHOOK__ALERTS_URL:-}
     command:
       - nextalpha-watcher
       - serve

@@ -3,26 +3,18 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-import yaml
 from fastapi import FastAPI, WebSocket
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
 from .app import App
-from .config import AppConfig, ServiceMode
+from .config import ServiceMode, load_config
 from .fastapi_ws_hub import FastAPIWsHub
 from .logging_utils import setup_logging
 
 
-def _load_config(path: str, service_mode: ServiceMode | None = None) -> AppConfig:
-    data = yaml.safe_load(open(path, encoding="utf-8").read()) or {}
-    if service_mode is not None:
-        data["service_mode"] = service_mode
-    return AppConfig(**data)
-
-
 def create_app(config_path: str, service_mode: ServiceMode | None = None) -> FastAPI:
-    cfg = _load_config(config_path, service_mode=service_mode)
+    cfg = load_config(config_path, service_mode=service_mode)
     # FastAPI exposes /metrics itself; disable standalone prometheus HTTP listener.
     cfg.metrics.enabled = False
     setup_logging(cfg.log_level)

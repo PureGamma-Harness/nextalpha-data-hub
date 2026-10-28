@@ -48,6 +48,8 @@ alerts:
 
 webhook:
   enabled: false
+  # Prefer env vars for secrets: WEBHOOK__URL, WEBHOOK__ALERTS_URL, WEBHOOK__PROXY_URL.
+  # Empty/null values here do not override the env vars.
   url: ""
   proxy_url: null
   alerts_url: ""
