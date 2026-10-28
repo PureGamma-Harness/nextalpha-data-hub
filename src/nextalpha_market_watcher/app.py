@@ -1665,7 +1665,6 @@ class App:
         await asyncio.sleep(max(1, delay_seconds))
         expected = self._ack_expected_by_close.get(close_time_ms, 0)
         batch_done_to_ack_values = self._batch_done_to_ack_by_close.get(close_time_ms, [])
-        batch_done_to_integrated_ack_values = self._batch_done_to_integrated_ack_by_close.get(close_time_ms, [])
         batch_done_to_compute_ack_values = self._batch_done_to_compute_ack_by_close.get(close_time_ms, [])
         batch_done_to_order_ack_values = self._batch_done_to_order_ack_by_close.get(close_time_ms, [])
         batch_ack_clients = len(self._batch_ack_clients_by_close.get(close_time_ms, set()))

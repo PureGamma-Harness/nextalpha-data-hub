@@ -19,7 +19,6 @@ from urllib.parse import urlparse, urlencode
 import aiohttp
 import httpx
 import orjson
-import websockets
 import socks
 
 from .config import AppConfig

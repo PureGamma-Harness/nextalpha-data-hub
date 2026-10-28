@@ -1,2 +1,0 @@
-[console_scripts]
-nextalpha-watcher = nextalpha_market_watcher.cli:main
