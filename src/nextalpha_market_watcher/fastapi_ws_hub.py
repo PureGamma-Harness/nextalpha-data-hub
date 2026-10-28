@@ -25,8 +25,10 @@ class FastAPIWsHub:
         name: str,
         on_client_connected: Callable[[WebSocket], Awaitable[None]] | None = None,
         on_client_message: Callable[[WebSocket, str], Awaitable[None]] | None = None,
+        send_timeout_s: float = 5.0,
     ) -> None:
         self._name = name
+        self._send_timeout_s = max(0.1, float(send_timeout_s))
         self._on_client_connected = on_client_connected
         self._on_client_message = on_client_message
         self._clients: set[WebSocket] = set()
@@ -77,19 +79,34 @@ class FastAPIWsHub:
         if not clients:
             return 0
 
-        sent = 0
-        stale: list[WebSocket] = []
-        for ws in clients:
+        async def _send_one(ws: WebSocket) -> bool:
             try:
-                await ws.send_text(message)
-                sent += 1
-            except Exception:
-                stale.append(ws)
+                await asyncio.wait_for(ws.send_text(message), timeout=self._send_timeout_s)
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "ws.client.send_failed name=%s error=%s",
+                    self._name,
+                    type(exc).__name__,
+                )
+                return False
+
+        # Send concurrently so one slow client cannot delay everyone else.
+        results = await asyncio.gather(*[_send_one(ws) for ws in clients])
+        stale = [ws for ws, ok in zip(clients, results) if not ok]
         if stale:
             async with self._lock:
                 for ws in stale:
                     self._clients.discard(ws)
-        return sent
+                remaining = len(self._clients)
+            logger.info("ws.client.dropped name=%s dropped=%s clients=%s", self._name, len(stale), remaining)
+            for ws in stale:
+                # Best-effort close so the peer's hold_until_disconnect loop ends.
+                try:
+                    await asyncio.wait_for(ws.close(), timeout=1.0)
+                except Exception:
+                    pass
+        return sum(1 for ok in results if ok)
 
     async def client_count(self) -> int:
         async with self._lock:

@@ -19,7 +19,7 @@ backfill:
   rest_timeout_seconds: 15.0
   rest_concurrency: 8
   rest_request_delay_seconds: 0.02
-  bars_1m: 32
+  bars_1m: 240
   bars_1h: 3
   klines_limit_cap: 1500
 

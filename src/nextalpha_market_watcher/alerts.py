@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -44,6 +45,8 @@ class AlertEngine:
         )
         self._cooldown: dict[str, int] = {}
         self._last_1m_open_ms: dict[str, int] = {}
+        # Strong references to in-flight webhook sends so they are not GC'd.
+        self._notify_tasks: set[asyncio.Task[None]] = set()
 
     def prune_to_symbols(self, keep: set[str]) -> None:
         for sym in list(self._history.keys()):
@@ -134,11 +137,8 @@ class AlertEngine:
             f"告警客户端连接数：{alert_clients}"
         )
         logger.warning("alert.trigger %s", msg)
-        try:
-            await self._notifier.send("告警通知", msg)
-        except Exception:
-            # Notification failure should not interrupt core alert ingestion.
-            logger.exception("alert.notify_failed symbol=%s interval=%s direction=%s", symbol, interval, direction)
+        # Fire-and-forget: webhook retries (up to ~20s) must not block alert fan-out.
+        self._schedule_notify("告警通知", msg, symbol, interval, direction)
         return AlertSignal(
             symbol=symbol,
             interval=interval,
@@ -152,6 +152,33 @@ class AlertEngine:
             reference_close_price=str(open_price),
             current_close_price=str(close_price),
         )
+
+    def _schedule_notify(self, title: str, msg: str, symbol: str, interval: str, direction: str) -> None:
+        task = asyncio.create_task(self._notifier.send(title, msg))
+        self._notify_tasks.add(task)
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._notify_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                # Notification failure should not interrupt core alert ingestion.
+                logger.error(
+                    "alert.notify_failed symbol=%s interval=%s direction=%s",
+                    symbol,
+                    interval,
+                    direction,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_done)
+
+    async def drain_notifications(self, timeout: float | None = None) -> None:
+        """Wait for in-flight webhook sends (used on shutdown and in tests)."""
+        if not self._notify_tasks:
+            return
+        await asyncio.wait(set(self._notify_tasks), timeout=timeout)
 
     def _is_interval_close_boundary(self, latest_1m: ClosedKline, bars: int) -> bool:
         # Binance close_time_ms ends with ...999; +1 aligns to the next minute boundary.

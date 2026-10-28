@@ -1,16 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .app import App
 from .config import ServiceMode, load_config
 from .fastapi_ws_hub import FastAPIWsHub
 from .logging_utils import setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+def runtime_task_status(task: asyncio.Task[None] | None) -> tuple[str, str]:
+    """Return (status, detail) for the background runtime task."""
+    if task is None:
+        return "starting", "runtime task not started"
+    if not task.done():
+        return "ok", ""
+    if task.cancelled():
+        return "stopped", "runtime task cancelled"
+    exc = task.exception()
+    if exc is not None:
+        # Only expose the exception type; full details go to the logs.
+        return "failed", type(exc).__name__
+    return "stopped", "runtime task exited"
 
 
 def create_app(config_path: str, service_mode: ServiceMode | None = None) -> FastAPI:
@@ -29,10 +47,20 @@ def create_app(config_path: str, service_mode: ServiceMode | None = None) -> Fas
     stop_event = asyncio.Event()
     runtime_task: asyncio.Task[None] | None = None
 
+    def _log_runtime_exit(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("runtime.task.failed", exc_info=exc)
+        elif not stop_event.is_set():
+            logger.error("runtime.task.exited_unexpectedly")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         nonlocal runtime_task
         runtime_task = asyncio.create_task(app_runtime.run(stop_event))
+        runtime_task.add_done_callback(_log_runtime_exit)
         try:
             yield
         finally:
@@ -45,8 +73,12 @@ def create_app(config_path: str, service_mode: ServiceMode | None = None) -> Fas
     app = FastAPI(title="nextalpha-market-watcher", lifespan=lifespan)
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok", "mode": cfg.service_mode}
+    async def healthz() -> JSONResponse:
+        status, detail = runtime_task_status(runtime_task)
+        body: dict[str, str] = {"status": status, "mode": cfg.service_mode}
+        if detail:
+            body["detail"] = detail
+        return JSONResponse(body, status_code=200 if status == "ok" else 503)
 
     @app.get("/metrics")
     async def metrics() -> Response:

@@ -1107,6 +1107,32 @@ def _kline_from_rest_row(symbol: str, interval: str, row: list) -> ClosedKline:
     )
 
 
+def next_silence_repair_backoff_ms(current_ms: int, max_ms: int) -> int:
+    """Exponential backoff step for WS-silence REST repair, capped at max_ms."""
+    return min(max(1, current_ms) * 2, max(1, max_ms))
+
+
+def watchdog_should_rebuild(
+    *,
+    now_ms: int,
+    stale_ms: int,
+    stale_threshold_ms: int,
+    alerted: bool,
+    last_rebuild_ms: int,
+) -> bool:
+    """Decide whether the watchdog should (re)trigger a shard rebuild.
+
+    A shard is rebuilt once it is stale. If it is still stale after another
+    full stale threshold since the last rebuild (i.e. the rebuild did not bring
+    data back), the watchdog re-arms and triggers again.
+    """
+    if stale_ms < stale_threshold_ms:
+        return False
+    if not alerted:
+        return True
+    return now_ms - last_rebuild_ms >= stale_threshold_ms
+
+
 class BinanceClient:
     def __init__(self, cfg: AppConfig) -> None:
         self._cfg = cfg
@@ -1374,6 +1400,13 @@ class BinanceClient:
         ):
             return
         silence_threshold_ms = 30_000
+        interval_ms = self._interval_to_ms(interval)
+        # Full-universe REST repair is expensive (one request per symbol). While WS
+        # stays silent, back off exponentially from the silence threshold up to one
+        # kline interval (no new closed candle can appear more often than that).
+        max_backoff_ms = max(silence_threshold_ms, min(interval_ms, 15 * 60_000) if interval_ms > 0 else 15 * 60_000)
+        backoff_ms = silence_threshold_ms
+        next_repair_ms = 0
         while True:
             await asyncio.sleep(10)
             last_ms = self._ws_last_event_ms.get(interval, 0)
@@ -1382,16 +1415,27 @@ class BinanceClient:
             now_ms = int(time.time() * 1000)
             no_event_ms = now_ms - last_ms
             if no_event_ms < silence_threshold_ms:
+                # WS healthy again: reset the backoff.
+                backoff_ms = silence_threshold_ms
+                next_repair_ms = 0
+                continue
+            if now_ms < next_repair_ms:
                 continue
             logger.warning(
-                "ws.silence.rest_repair interval=%s no_event_ms=%s symbols=%s",
+                "ws.silence.rest_repair interval=%s no_event_ms=%s symbols=%s next_backoff_ms=%s",
                 interval,
                 no_event_ms,
                 len(symbols),
+                backoff_ms,
             )
             # limit=1 often returns the currently forming candle; use 2 so we can
             # still pick the previous fully closed candle.
-            await self._backfill_batch(symbols, interval, out_queue, limit_override=2)
+            try:
+                await self._backfill_batch(symbols, interval, out_queue, limit_override=2)
+            except Exception:
+                logger.exception("ws.silence.rest_repair_failed interval=%s", interval)
+            next_repair_ms = int(time.time() * 1000) + backoff_ms
+            backoff_ms = next_silence_repair_backoff_ms(backoff_ms, max_backoff_ms)
 
     async def iter_closed_klines(
         self,
@@ -2171,6 +2215,9 @@ class BinanceClient:
         else:
             stale_threshold_ms = interval_ms * no_data_periods
         check_seconds = max(1, self._cfg.binance.ws_watchdog_check_seconds)
+        # Wall time of the last rebuild per shard, used to re-arm the watchdog
+        # when a rebuild does not restore data flow.
+        last_rebuild_ms: dict[str, int] = {}
         while True:
             await asyncio.sleep(check_seconds)
             now_ms = int(time.time() * 1000)
@@ -2183,8 +2230,15 @@ class BinanceClient:
                 if stale_ms < stale_threshold_ms:
                     continue
                 stale_shards += 1
-                if shard_alerted.get(shard_id, False):
+                if not watchdog_should_rebuild(
+                    now_ms=now_ms,
+                    stale_ms=stale_ms,
+                    stale_threshold_ms=stale_threshold_ms,
+                    alerted=shard_alerted.get(shard_id, False),
+                    last_rebuild_ms=last_rebuild_ms.get(shard_id, 0),
+                ):
                     continue
+                last_rebuild_ms[shard_id] = now_ms
                 new_generation = self._ws_rebuild_generation.get(shard_id, 0) + 1
                 self._ws_rebuild_generation[shard_id] = new_generation
                 shard_alerted[shard_id] = True

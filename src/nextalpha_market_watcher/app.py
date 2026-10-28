@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -126,10 +126,8 @@ class App:
         stop_event = stop if stop is not None else asyncio.Event()
         start_metrics_server(self._cfg)
         logger.info("service.start mode=%s", self._cfg.service_mode)
-        syms = await self._binance.fetch_symbols()
+        syms = await self._fetch_symbols_with_retry()
         logger.info("symbols.loaded count=%s", len(syms))
-        if not syms:
-            raise RuntimeError("No symbols found for Binance U perpetual.")
 
         ingest_task: asyncio.Task[None] | None = None
         refresh_task: asyncio.Task[None] | None = None
@@ -223,7 +221,15 @@ class App:
                     continue
 
                 if refresh_task in done:
-                    new_syms = await self._binance.fetch_symbols()
+                    try:
+                        new_syms = await self._binance.fetch_symbols()
+                    except Exception:
+                        # Keep running on the current universe; retry next cycle.
+                        logger.exception("symbols.refresh.failed keep_current=%s", len(syms))
+                        new_syms = list(syms)
+                    if not new_syms:
+                        logger.warning("symbols.refresh.empty keep_current=%s", len(syms))
+                        new_syms = list(syms)
                     if set(new_syms) != set(syms):
                         if self._should_defer_symbol_refresh_to_kline_batch():
                             self._queue_symbol_refresh(syms, new_syms)
@@ -263,7 +269,33 @@ class App:
                 *[x for x in to_cancel if x is not None],
                 return_exceptions=True,
             )
+            if self._alerts is not None:
+                # Give in-flight alert webhooks a brief chance to finish.
+                await self._alerts.drain_notifications(timeout=5.0)
             await self._latency_redis.aclose()
+
+    async def _fetch_symbols_with_retry(self, attempts: int = 5, base_delay_s: float = 2.0) -> list[str]:
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                syms = await self._binance.fetch_symbols()
+                if syms:
+                    return syms
+                last_exc = RuntimeError("No symbols found for Binance U perpetual.")
+            except Exception as exc:
+                last_exc = exc
+            if attempt < attempts:
+                delay = min(30.0, base_delay_s * (2 ** (attempt - 1)))
+                logger.warning(
+                    "symbols.load.retry attempt=%s/%s delay_s=%.1f error=%s",
+                    attempt,
+                    attempts,
+                    delay,
+                    last_exc,
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     def _should_defer_symbol_refresh_to_kline_batch(self) -> bool:
         return self._cfg.service_mode in ("klines", "all") and self._klines_ws is not None
@@ -1742,7 +1774,7 @@ class App:
         interval = str(summary.get("interval") or self._klines_interval or "kline")
         safe_interval = "".join(ch if ch.isalnum() else "_" for ch in interval) or "kline"
         if close_time_ms > 0:
-            stamp = datetime.fromtimestamp(close_time_ms / 1000).strftime("%Y%m%d_%H%M%S")
+            stamp = datetime.fromtimestamp(close_time_ms // 1000, tz=timezone.utc).strftime("%Y%m%d_%H%M%SZ")
         else:
             stamp = str(int(time.time() * 1000))
         logs_dir = Path("logs")
@@ -2233,7 +2265,7 @@ class App:
             return str(close_time_ms)
         if ts_ms <= 0:
             return str(close_time_ms)
-        return datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(ts_ms // 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     def _percentile(self, values_sorted: list[int], pct: float) -> float:
         if not values_sorted:

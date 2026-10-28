@@ -32,7 +32,8 @@ class BackfillConfig(BaseModel):
     rest_timeout_seconds: float = 15.0
     rest_concurrency: int = 8
     rest_request_delay_seconds: float = 0.02
-    bars_1m: int = 32
+    # >= 240 so 1h (60 bars) and 4h (240 bars) alert windows are warm after (re)connect.
+    bars_1m: int = 240
     bars_1h: int = 3
     klines_limit_cap: int = 1500
 
