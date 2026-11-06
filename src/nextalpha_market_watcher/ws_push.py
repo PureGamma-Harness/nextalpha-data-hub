@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 
 import orjson
 import websockets
@@ -52,7 +52,7 @@ class WsBroadcaster:
     async def broadcast_json(self, payload: object, topic: str | None = None) -> int:
         msg = orjson.dumps(payload).decode("utf-8")
         async with self._lock:
-            clients: Iterable[WebSocketServerProtocol] = tuple(self._clients)
+            clients = tuple(self._clients)
         if not clients:
             return 0
 
@@ -66,9 +66,11 @@ class WsBroadcaster:
         results = await asyncio.gather(*[_send_one(c) for c in clients], return_exceptions=False)
         sent = sum(1 for ok in results if ok)
 
-        if sent != len(tuple(clients)):
+        if sent != len(clients):
             async with self._lock:
-                stale = {c for c in self._clients if c.closed}
+                # Use send outcomes instead of the legacy .closed attribute,
+                # which modern websockets server connections do not expose.
+                stale = {client for client, ok in zip(clients, results) if not ok}
                 for c in stale:
                     self._clients.discard(c)
         return sent
