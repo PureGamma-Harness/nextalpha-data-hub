@@ -169,6 +169,7 @@ class FastAPIWsHub:
             async with self._lock:
                 for ws in stale:
                     self._clients.discard(ws)
+                    self._client_topics.pop(ws, None)
         return sent
 
     async def client_count(self, topic: str | None = None) -> int:

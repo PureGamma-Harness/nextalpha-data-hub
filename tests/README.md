@@ -1,5 +1,17 @@
 # tests
 
+## Offline unit tests
+
+After installing the project dependencies (`python -m pip install -e .`), run:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+These tests use in-memory WebSocket doubles and do not start the service, contact
+an exchange, or require Redis. The smoke tests below are separate integration
+checks and require running services.
+
 用于本地或服务器上做「下游客户端接入」烟雾测试，验证：
 
 - 能否同时消费 `klines.all.1h`、`klines.majors.1h` 两个 K 线 topic；
